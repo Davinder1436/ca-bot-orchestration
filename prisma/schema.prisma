@@ -1,0 +1,76 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Account {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  pin            String
+  country        String    @default("CA")
+  status         String    @default("IDLE")
+  proxyId        String?
+  proxy          Proxy?    @relation(fields: [proxyId], references: [id])
+  jobIds         String[]
+  lastLoginAt    DateTime?
+  sessionToken   String?
+  tokenExpiresAt DateTime?
+  notes          String?
+  captures       JobCapture[]
+  sessions       WorkerSession[]
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+model Proxy {
+  id          String    @id @default(cuid())
+  url         String    @unique
+  zone        String?
+  label       String?
+  status      String    @default("ACTIVE")
+  lastChecked DateTime?
+  failCount   Int       @default(0)
+  accounts    Account[]
+  createdAt   DateTime  @default(now())
+}
+
+model JobCapture {
+  id         String   @id @default(cuid())
+  accountId  String
+  account    Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  jobId      String
+  scheduleId String
+  jobTitle   String?
+  location   String?
+  applyUrl   String?
+  status     String   @default("APPLIED")
+  capturedAt DateTime @default(now())
+}
+
+model WorkerSession {
+  id            String    @id @default(cuid())
+  accountId     String
+  account       Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  containerId   String?
+  status        String
+  startedAt     DateTime  @default(now())
+  lastHeartbeat DateTime?
+  endedAt       DateTime?
+  errorMessage  String?
+}
+
+model Event {
+  id        String   @id @default(cuid())
+  type      String
+  accountId String?
+  payload   Json
+  createdAt DateTime @default(now())
+
+  @@index([type])
+  @@index([accountId])
+  @@index([createdAt])
+}

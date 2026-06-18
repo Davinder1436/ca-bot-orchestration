@@ -1,0 +1,22 @@
+{
+  "name": "ca-bot-v2",
+  "private": true,
+  "version": "2.0.0",
+  "description": "Amazon warehouse job sniper — multi-account, event-driven, fully automated",
+  "scripts": {
+    "dev:orchestrator": "pnpm --filter orchestrator dev",
+    "dev:worker": "pnpm --filter worker dev",
+    "dev:email": "pnpm --filter email-service dev",
+    "dev:notify": "pnpm --filter notification-service dev",
+    "dev:dashboard": "pnpm --filter dashboard dev",
+    "build": "pnpm -r build",
+    "db:generate": "prisma generate --schema=prisma/schema.prisma",
+    "db:migrate": "prisma migrate dev --schema=prisma/schema.prisma",
+    "db:studio": "prisma studio --schema=prisma/schema.prisma"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "prisma": "^5.17.0",
+    "@prisma/client": "^5.17.0"
+  }
+}

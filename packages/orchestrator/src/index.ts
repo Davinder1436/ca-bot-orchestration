@@ -25,7 +25,7 @@ async function main() {
   const bus = new EventBus(REDIS_URL);
   await bus.connect();
 
-  const workerManager = new WorkerManager(REDIS_URL, db, bus);
+  const workerManager = new WorkerManager(REDIS_URL, db, bus, redis);
   const healthMonitor = new HealthMonitor(redis, db, workerManager);
   const proxyService = new ProxyService(db);
 
@@ -33,7 +33,7 @@ async function main() {
   const app = express();
   app.use(cors({ origin: "*" }));
   app.use(express.json({ limit: "1mb" }));
-  app.use("/api", createRouter(db, workerManager, bus));
+  app.use("/api", createRouter(db, workerManager, bus, redis));
 
   const httpServer = createServer(app);
   const io = new SocketServer(httpServer, { cors: { origin: "*" } });
@@ -41,7 +41,10 @@ async function main() {
   // Forward all bus events to connected dashboard clients
   bus.subscribe("*", (event) => {
     io.emit("event", event);
-    // Persist to DB
+    // Skip DB persistence for high-frequency poll ticks (visualised in-memory only)
+    if ((event.type as string).startsWith("poll:") || (event.type as string).startsWith("test:")) {
+      return;
+    }
     db.event.create({ data: { type: event.type, accountId: event.accountId, payload: event.payload as object } })
       .catch(console.error);
   });
@@ -54,6 +57,15 @@ async function main() {
       where: { accountId, endedAt: null },
       data: { lastHeartbeat: new Date() },
     });
+  });
+
+  // Self-reported crash — save logs immediately instead of waiting 90s for HealthMonitor
+  bus.subscribe("worker:crashed", async (event) => {
+    const p = event.payload as { accountId: string; reason?: string };
+    if (p.reason === "heartbeat_timeout") return; // already handled by HealthMonitor path
+    // 800ms delay: let the container finish flushing its final log lines to Docker
+    await new Promise(r => setTimeout(r, 800));
+    await workerManager.handleDeadWorker(p.accountId);
   });
 
   // Worker state changes → update account status

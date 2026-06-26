@@ -1,21 +1,20 @@
-FROM mcr.microsoft.com/playwright:v1.46.1-jammy AS base
+FROM mcr.microsoft.com/playwright:v1.61.0-jammy AS builder
 WORKDIR /app
+COPY tsconfig.base.json .
+COPY packages/worker/package.json packages/worker/
+RUN cd packages/worker && npm install
+COPY packages/worker packages/worker/
+RUN cd packages/worker && npm run build
 
-FROM base AS builder
-COPY package.json pnpm-workspace.yaml tsconfig.base.json ./
-COPY packages/worker/package.json ./packages/worker/
-RUN npm install -g pnpm && pnpm install --filter worker
-RUN npx playwright install chromium --with-deps
-COPY packages/worker ./packages/worker
-RUN cd packages/worker && pnpm build
-
-FROM base
+FROM mcr.microsoft.com/playwright:v1.61.0-jammy
 WORKDIR /app
-COPY --from=builder /app/node_modules ./node_modules
+RUN apt-get update && apt-get install -y xvfb && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/packages/worker/node_modules ./node_modules
 COPY --from=builder /app/packages/worker/dist ./dist
 COPY --from=builder /app/packages/worker/package.json ./
-# Playwright browser binaries
-COPY --from=builder /root/.cache/ms-playwright /root/.cache/ms-playwright
+# Chrome extension that exposes window.__captureTab() via captureVisibleTab().
+# This gives GPU-composited screenshots with all 9 captcha tiles rendered.
+COPY packages/worker/captcha-extension /app/captcha-extension
 ENV NODE_ENV=production
-ENV PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
-CMD ["node", "dist/index.js"]
+ENV DISPLAY=:99
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock && Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset & sleep 2 && node dist/index.js"]

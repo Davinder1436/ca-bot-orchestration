@@ -7,6 +7,8 @@ import { Jobs } from "./pages/Jobs";
 import { Proxies } from "./pages/Proxies";
 import { Logs } from "./pages/Logs";
 import { Settings } from "./pages/Settings";
+import { Polling } from "./pages/Polling";
+import { Tests } from "./pages/Tests";
 
 export default function App() {
   return (
@@ -15,9 +17,11 @@ export default function App() {
         <Route path="/" element={<Overview />} />
         <Route path="/accounts" element={<Accounts />} />
         <Route path="/jobs" element={<Jobs />} />
+        <Route path="/polling" element={<Polling />} />
         <Route path="/proxies" element={<Proxies />} />
         <Route path="/logs" element={<Logs />} />
         <Route path="/settings" element={<Settings />} />
+        <Route path="/tests" element={<Tests />} />
       </Route>
     </Routes>
   );

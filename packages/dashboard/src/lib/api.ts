@@ -72,3 +72,25 @@ export const fetchJobs = (params?: { accountId?: string; limit?: number }) =>
 // Events
 export const fetchEvents = (params?: { type?: string; limit?: number }) =>
   api.get<BusEvent[]>("/events", { params }).then((r) => r.data);
+
+// Worker details
+export interface WorkerSession {
+  id: string;
+  accountId: string;
+  containerId?: string;
+  status: string;
+  startedAt: string;
+  lastHeartbeat?: string;
+  endedAt?: string;
+  errorMessage?: string;
+}
+
+export interface WorkerDetails {
+  account: Account & { _count: { captures: number } };
+  containerId: string | null;
+  sessions: WorkerSession[];
+  recentEvents: (BusEvent & { id: string; createdAt: string })[];
+}
+
+export const fetchWorkerDetails = (accountId: string) =>
+  api.get<WorkerDetails>(`/workers/${accountId}/details`).then((r) => r.data);

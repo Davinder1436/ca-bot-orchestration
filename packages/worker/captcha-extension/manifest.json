@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Amazon Captcha Screenshot Helper",
+  "version": "1.0",
+  "permissions": ["tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://auth.hiring.amazon.com/*",
+        "*://auth.hiring.amazon.ca/*",
+        "https://hiring.amazon.com/*",
+        "https://hiring.amazon.ca/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

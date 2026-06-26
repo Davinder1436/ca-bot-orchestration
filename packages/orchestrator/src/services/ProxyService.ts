@@ -50,7 +50,7 @@ export class ProxyService {
 
   async runHealthChecks() {
     const proxies = await this.db.proxy.findMany({ where: { status: { not: "DEAD" } } });
-    await Promise.allSettled(proxies.map((p) => this.checkHealth(p.id)));
+    await Promise.allSettled(proxies.map((p: { id: string }) => this.checkHealth(p.id)));
   }
 
   async getAvailableProxy(): Promise<string | null> {

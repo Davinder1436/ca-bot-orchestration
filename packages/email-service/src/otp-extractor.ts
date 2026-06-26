@@ -1,11 +1,14 @@
-// Known Amazon OTP email patterns
+// Known Amazon OTP email patterns — order matters, more specific first.
+// The Amazon Jobs email format is: "verification code for Amazon Jobs: 639449"
 const OTP_PATTERNS = [
   /\b(\d{6})\b(?=\s*(?:is your|verification|code|PIN))/i,
   /verification code[:\s]+(\d{6})/i,
+  /Amazon Jobs[:\s]+(\d{6})/i,             // "verification code for Amazon Jobs: 639449"
+  /code\b[^:\n]{0,40}:\s*(\d{6})/i,        // "code ... : 639449" (any text ≤40 chars before colon)
   /one.time.pass(?:word|code)[:\s]+(\d{6})/i,
   /your code is[:\s]+(\d{6})/i,
   /enter[:\s]+(\d{6})/i,
-  /\b(\d{6})\b/, // last resort: any 6-digit number
+  /\b(\d{6})\b/,                           // last resort: any 6-digit number
 ];
 
 // Patterns to identify original account email when using forwarding

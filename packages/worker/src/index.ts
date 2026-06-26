@@ -3,14 +3,25 @@ import { EventBus } from "./events/event-bus";
 import { launchBrowser, createContext, pickUAIndex, USER_AGENTS, VIEWPORTS } from "./browser/launch";
 import { login } from "./amazon/login";
 import { JobPoller } from "./amazon/job-poller";
+import { RunLogger } from "./RunLogger";
 import { applyForJob } from "./amazon/apply";
 import { solveCaptchaOnPage } from "./amazon/captcha";
-import type { Browser, BrowserContext } from "playwright";
+import type { Browser, BrowserContext, Page } from "playwright";
 import axios from "axios";
 
 const REDIS_URL = process.env.REDIS_URL!;
 const ACCOUNT_ID = process.env.ACCOUNT_ID!;
 const PROXY_URL = process.env.PROXY_URL;
+
+// Bright Data ISP fixed-session proxy — each account gets a consistent exit IP
+// via a session ID derived from its accountId prefix
+const ISP_HOST = process.env.BRIGHTDATA_ISP_HOST;
+const ISP_PORT = process.env.BRIGHTDATA_ISP_PORT;
+const ISP_USER = process.env.BRIGHTDATA_ISP_USER;
+const ISP_PASS = process.env.BRIGHTDATA_ISP_PASS;
+const ispProxyUrl = (ISP_HOST && ISP_PORT && ISP_USER && ISP_PASS)
+  ? `http://${ISP_USER}-session-${ACCOUNT_ID.slice(0, 8)}:${ISP_PASS}@${ISP_HOST}:${ISP_PORT}`
+  : undefined;
 
 if (!REDIS_URL || !ACCOUNT_ID) {
   console.error("[Worker] REDIS_URL and ACCOUNT_ID are required");
@@ -48,16 +59,34 @@ async function main() {
   let context: BrowserContext | null = null;
   let poller: JobPoller | null = null;
   let running = true;
+  let activePage: Page | null = null;
+
+  const runLogger = new RunLogger(redis, ACCOUNT_ID);
 
   // Heartbeat every 30s
   const heartbeatInterval = setInterval(async () => {
     await bus.publish("worker:heartbeat", { accountId: ACCOUNT_ID });
   }, 30_000);
 
-  const shutdown = async () => {
+  // Screenshot capture loop — stores latest JPEG in Redis for live debug view
+  const screenshotInterval = setInterval(async () => {
+    const page = activePage;
+    if (!page || page.isClosed()) return;
+    try {
+      const buf = await page.screenshot({ type: "jpeg", quality: 60 });
+      await redis.set(`worker:screenshot:${ACCOUNT_ID}`, buf.toString("base64"), "EX", 15);
+    } catch { /* page may be navigating */ }
+  }, 1500);
+
+  let cmdSub: Redis | null = null;
+
+  const shutdown = async (crashReason?: string) => {
     running = false;
     clearInterval(heartbeatInterval);
+    clearInterval(screenshotInterval);
     poller?.stop();
+    await runLogger.finalize(crashReason ? "crashed" : "stopped", crashReason).catch(() => {});
+    await cmdSub?.quit().catch(() => {});
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
     await bus.disconnect();
@@ -74,8 +103,19 @@ async function main() {
   const account = await fetchAccountConfig();
   console.log(`[Worker:${ACCOUNT_ID}] Account: ${account.email}, Jobs: ${account.jobIds.join(", ")}`);
 
+  // ISP proxy takes priority; falls back to per-account proxy from DB
+  const proxyUrl = ispProxyUrl ?? PROXY_URL ?? account.proxy?.url;
+  if (ispProxyUrl) {
+    console.log(`[Worker:${ACCOUNT_ID}] Using Bright Data ISP fixed-session proxy (session: ${ACCOUNT_ID.slice(0, 8)})`);
+  }
+
   const uaIndex = pickUAIndex(ACCOUNT_ID);
-  const proxyUrl = PROXY_URL ?? account.proxy?.url;
+
+  await runLogger.init({
+    email: account.email,
+    jobIds: account.jobIds,
+    proxyUrl: proxyUrl ?? null,
+  });
 
   // Launch browser
   browser = await launchBrowser({ proxyUrl });
@@ -84,6 +124,28 @@ async function main() {
     viewport: VIEWPORTS[uaIndex % VIEWPORTS.length],
     proxyUrl,
     timezone: account.country === "CA" ? "America/Toronto" : "America/New_York",
+  });
+
+  // Track active page for screenshots and browser console forwarding
+  context.on("page", (page) => {
+    activePage = page;
+    page.on("console", (msg) => {
+      const payload = JSON.stringify({ level: msg.type(), text: msg.text(), ts: Date.now() });
+      // Live stream for open panels
+      redis.publish(`worker:console:${ACCOUNT_ID}`, payload).catch(() => {});
+      // Persistent history (last 500 messages, 24h TTL)
+      redis.rpush(`worker:console:log:${ACCOUNT_ID}`, payload)
+        .then(() => redis.ltrim(`worker:console:log:${ACCOUNT_ID}`, -500, -1))
+        .then(() => redis.expire(`worker:console:log:${ACCOUNT_ID}`, 86400))
+        .catch(() => {});
+    });
+    page.on("close", () => {
+      if (activePage === page) {
+        // Fall back to another open page instead of going null
+        const pages = context!.pages();
+        activePage = pages.find(p => p !== page) ?? null;
+      }
+    });
   });
 
   await setState(bus, "LOGGING_IN");
@@ -97,18 +159,45 @@ async function main() {
       accountId: ACCOUNT_ID,
     });
   } catch (err) {
+    const reason = String(err);
     console.error(`[Worker:${ACCOUNT_ID}] Login failed:`, err);
     await setState(bus, "ERROR");
     await bus.publish("worker:crashed", {
       accountId: ACCOUNT_ID,
       email: account.email,
-      reason: String(err),
+      reason,
     });
-    await shutdown();
+    await shutdown(reason);
     return;
   }
 
   await setState(bus, "POLLING");
+
+  // The login page is now on hiring.amazon.ca/app#/jobSearch — keep it as
+  // the dedicated polling page. apply.ts always opens its own newPage(), so
+  // this page will never be navigated away by the apply flow.
+  const pollingPage = context.pages().find(p => p.url().includes("jobSearch"))
+    ?? context.pages()[context.pages().length - 1];
+
+  // Store token in Redis so orchestrator can use it for rate-limit tests
+  await redis.set(`worker:token:${ACCOUNT_ID}`, accessToken, "EX", 3600);
+
+  // Subscribe to rate-control commands from orchestrator dashboard
+  cmdSub = redis.duplicate();
+  await cmdSub.subscribe(`poller:cmd:${ACCOUNT_ID}`, `worker:test-cmd:${ACCOUNT_ID}`);
+  cmdSub.on("message", (_ch, raw) => {
+    try {
+      const cmd = JSON.parse(raw);
+      if (cmd.type === "setInterval" && typeof cmd.intervalMs === "number") {
+        poller?.setIntervalMs(cmd.intervalMs);
+      }
+      // Rate-limit test command — runs inside the worker's authenticated browser
+      if (cmd.testId && cmd.jobId) {
+        const rpms: number[] = cmd.rpms ?? [5, 10, 20, 30, 40, 50, 60, 80, 100];
+        poller?.runRateLimitTest(cmd.testId, cmd.jobId, rpms).catch(console.error);
+      }
+    } catch { /* ignore malformed */ }
+  });
 
   // Subscribe to job:captured events for THIS account to trigger apply
   const sub = redis.duplicate();
@@ -137,7 +226,8 @@ async function main() {
     }
   });
 
-  // Start polling
+  // Start polling — requests go through the browser page so session cookies
+  // are automatically included (same mechanism as the old Chrome extension's pageFetch)
   poller = new JobPoller(
     {
       accountId: ACCOUNT_ID,
@@ -145,7 +235,10 @@ async function main() {
       country: account.country,
       jobIds: account.jobIds,
       accessToken,
+      page: pollingPage,
       intervalMs: 5_000,
+      runLogger,
+      redis,
     },
     bus
   );
@@ -166,7 +259,11 @@ async function main() {
         country: account.country,
         accountId: ACCOUNT_ID,
       });
+      await redis.set(`worker:token:${ACCOUNT_ID}`, newToken, "EX", 3600);
+      const newPollingPage = context!.pages().find(p => p.url().includes("jobSearch"))
+        ?? context!.pages()[context!.pages().length - 1];
       poller!.updateToken(newToken);
+      poller!.updatePage(newPollingPage);
       await setState(bus, "POLLING");
       poller!.start(); // restart
     } catch (err) {

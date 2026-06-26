@@ -22,6 +22,16 @@ const VIEWPORTS = [
   { width: 1536, height: 864 },
 ];
 
+// Chrome's --proxy-server flag does not accept credentials in the URL.
+// Parse the URL and pass credentials via Playwright's native proxy option instead.
+function parseProxyUrl(url: string): { server: string; username?: string; password?: string } {
+  const parsed = new URL(url);
+  const server = `${parsed.protocol}//${parsed.host}`;
+  const username = parsed.username ? decodeURIComponent(parsed.username) : undefined;
+  const password = parsed.password ? decodeURIComponent(parsed.password) : undefined;
+  return { server, ...(username && { username }), ...(password && { password }) };
+}
+
 export async function launchBrowser(opts: LaunchOptions = {}): Promise<Browser> {
   const args = [
     "--no-sandbox",
@@ -32,15 +42,17 @@ export async function launchBrowser(opts: LaunchOptions = {}): Promise<Browser> 
     "--window-position=0,0",
     "--ignore-certificate-errors",
     "--ignore-certificate-errors-spki-list",
+    // Load our minimal extension so content.js exposes window.__captureTab().
+    // captureVisibleTab() gives GPU-composited output with all 9 captcha tiles rendered,
+    // unlike page.screenshot() which misses lazy-loaded rows 2-3 in headless mode.
+    "--load-extension=/app/captcha-extension",
+    "--disable-extensions-except=/app/captcha-extension",
   ];
 
-  if (opts.proxyUrl) {
-    args.push(`--proxy-server=${opts.proxyUrl}`);
-  }
-
   const browser = await chromium.launch({
-    headless: true,
+    headless: false, // extensions require headed mode; Xvfb provides the display in Docker
     args,
+    proxy: opts.proxyUrl ? parseProxyUrl(opts.proxyUrl) : undefined,
     executablePath: process.env.CHROMIUM_PATH,
   });
 
@@ -63,29 +75,14 @@ export async function createContext(browser: Browser, opts: LaunchOptions = {}):
     },
   });
 
-  // Stealth: override navigator.webdriver + plugins
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
     Object.defineProperty(navigator, "languages", { get: () => ["en-CA", "en"] });
-    // Randomize canvas fingerprint slightly
-    const origGetContext = HTMLCanvasElement.prototype.getContext;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (HTMLCanvasElement.prototype as any).getContext = function (type: string, ...args: unknown[]) {
-      const ctx = origGetContext.apply(this, [type, ...args] as Parameters<typeof origGetContext>);
-      if (type === "2d" && ctx) {
-        const ctx2d = ctx as CanvasRenderingContext2D;
-        const orig = ctx2d.getImageData.bind(ctx2d);
-        ctx2d.getImageData = function (x: number, y: number, w: number, h: number) {
-          const data = orig(x, y, w, h);
-          for (let i = 0; i < data.data.length; i += 100) {
-            data.data[i] ^= 1;
-          }
-          return data;
-        };
-      }
-      return ctx;
-    };
+    Object.defineProperty(window, "chrome", {
+      writable: true,
+      value: { runtime: {}, loadTimes: () => {}, csi: () => {}, app: {} },
+    });
   });
 
   return context;

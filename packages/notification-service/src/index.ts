@@ -2,12 +2,18 @@ import Redis from "ioredis";
 import { createBot, sendAlert } from "./telegram-bot";
 
 const REDIS_URL = process.env.REDIS_URL!;
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
-const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID!;
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID;
 
-if (!BOT_TOKEN || !ADMIN_CHAT_ID) {
-  console.error("[Notifications] TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT_ID required");
-  process.exit(1);
+const telegramEnabled = !!(
+  BOT_TOKEN &&
+  ADMIN_CHAT_ID &&
+  !BOT_TOKEN.includes("...") &&
+  !BOT_TOKEN.startsWith("123456:")
+);
+
+if (!telegramEnabled) {
+  console.log("[Notifications] Telegram disabled (no valid credentials) — logging to console only");
 }
 
 type EventPayload = Record<string, string | number | boolean | undefined>;
@@ -55,9 +61,18 @@ function formatEvent(type: string, payload: EventPayload): string | null {
 
 async function main() {
   const redis = new Redis(REDIS_URL);
-  const { bot, adminChatId } = createBot(BOT_TOKEN, ADMIN_CHAT_ID);
 
-  // Subscribe to all events
+  let bot: ReturnType<typeof createBot>["bot"] | null = null;
+  let adminChatId = "";
+
+  if (telegramEnabled) {
+    const created = createBot(BOT_TOKEN!, ADMIN_CHAT_ID!);
+    bot = created.bot;
+    adminChatId = created.adminChatId;
+    bot.launch();
+    console.log("[Notifications] Telegram bot started, listening for events");
+  }
+
   const sub = redis.duplicate();
   await sub.subscribe("event:*");
 
@@ -65,30 +80,21 @@ async function main() {
     try {
       const event = JSON.parse(raw) as { type: string; payload: EventPayload };
       const message = formatEvent(event.type, event.payload);
-      if (message) {
+      if (!message) return;
+
+      if (telegramEnabled && bot) {
         await sendAlert(bot, adminChatId, message);
+      } else {
+        // Console-only fallback when Telegram is not configured
+        console.log(`[Notifications] ${event.type}:`, message.replace(/[*`[\]()]/g, ""));
       }
     } catch (err) {
       console.error("[Notifications] Failed to process event:", err);
     }
   });
 
-  // Daily summary cron (every day at 11:59 PM)
-  const now = new Date();
-  const midnight = new Date(now);
-  midnight.setHours(23, 59, 0, 0);
-  const msUntilMidnight = midnight.getTime() - now.getTime();
-  setTimeout(async function sendDailySummary() {
-    // Handled by a "daily:summary" event published by orchestrator
-    setTimeout(sendDailySummary, 24 * 60 * 60 * 1000);
-  }, msUntilMidnight);
-
-  // Launch bot
-  bot.launch();
-  console.log("[Notifications] Telegram bot started, listening for events");
-
   process.on("SIGTERM", async () => {
-    bot.stop("SIGTERM");
+    if (bot) bot.stop("SIGTERM");
     await sub.quit();
     await redis.quit();
     process.exit(0);

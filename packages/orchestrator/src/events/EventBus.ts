@@ -2,6 +2,7 @@ import Redis from "ioredis";
 
 export type EventType =
   | "job:captured"
+  | "job:application_confirmed"
   | "session:expired"
   | "worker:crashed"
   | "worker:started"
@@ -11,9 +12,17 @@ export type EventType =
   | "proxy:failed"
   | "proxy:reassigned"
   | "account:banned"
+  | "account:possible_shadow_ban"
   | "captcha:solved"
   | "captcha:failed"
-  | "daily:summary";
+  | "daily:summary"
+  | "poll:tick"
+  | "test:log"
+  | "test:rpmResult"
+  | "test:phaseComplete"
+  | "test:complete"
+  | "test:cancelled"
+  | "test:error";
 
 export interface BusEvent {
   type: EventType;

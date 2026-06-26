@@ -13,15 +13,10 @@ export async function applyForJob(
     await page.goto(applyUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
     await sleep(1500, 2500);
 
-    // Handle CAPTCHA if present
+    // Handle CAPTCHA if present (throws after MAX_ATTEMPTS failures)
     const captchaPresent = await page.locator('text="Let\'s confirm you are human"').count();
     if (captchaPresent > 0) {
-      const solved = await solveCaptchaOnPage(page, accountEmail);
-      if (!solved) {
-        console.error(`[Apply:${accountEmail}] Could not solve captcha`);
-        await page.close();
-        return false;
-      }
+      await solveCaptchaOnPage(page, accountEmail);
     }
 
     // Click Next if present (Createapp flow)

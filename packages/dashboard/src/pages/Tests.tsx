@@ -117,6 +117,22 @@ function PhaseTable({ result }: { result: PhaseResult }) {
   );
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function generateRpms(start: number, end: number, step: number): number[] {
+  if (step <= 0 || start > end || start < 1) return [];
+  const rpms: number[] = [];
+  for (let rpm = start; rpm <= end; rpm += step) rpms.push(rpm);
+  return rpms;
+}
+
+function estimateTime(rpms: number[]): string {
+  if (rpms.length === 0) return "—";
+  const ms = rpms.reduce((acc, rpm) => acc + 5 * Math.ceil(60_000 / rpm) + 5_000, 0);
+  const s = Math.round(ms / 1_000);
+  return s < 60 ? `~${s}s` : `~${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
 // ─── Main page ────────────────────────────────────────────────────────────────
 
 export function Tests() {
@@ -124,6 +140,11 @@ export function Tests() {
   const [runningIds, setRunningIds]     = useState<string[]>([]);
   const [selectedAccountId, setAccount] = useState("");
   const [jobId, setJobId]               = useState("");
+
+  const [startRpm,   setStartRpm]   = useState(100);
+  const [endRpm,     setEndRpm]     = useState(210);
+  const [stepRpm,    setStepRpm]    = useState(10);
+  const [proxyType,  setProxyType]  = useState<"session" | "rotating_dc">("session");
 
   const [testId, setTestId]             = useState<string | null>(null);
   const [running, setRunning]           = useState(false);
@@ -212,6 +233,8 @@ export function Tests() {
     if (!selectedAccountId) { setStartError("Select an account with a running worker"); return; }
     if (!jobId.trim()) { setStartError("Job ID is required"); return; }
     if (!runningIds.includes(selectedAccountId)) { setStartError("This account's worker is not running — start it first"); return; }
+    const rpms = generateRpms(startRpm, endRpm, stepRpm);
+    if (rpms.length === 0) { setStartError("Invalid RPM range — check start, end, and step values"); return; }
     setStartError("");
     setLogs([]);
     setPhaseResults([]);
@@ -221,6 +244,8 @@ export function Tests() {
       const resp = await api.post<{ testId: string }>("/tests/rate-limit/start", {
         accountId: selectedAccountId,
         jobId: jobId.trim(),
+        rpms,
+        proxyType,
       });
       setTestId(resp.data.testId);
     } catch (err: unknown) {
@@ -308,11 +333,77 @@ export function Tests() {
               />
             </div>
 
-            {/* RPM levels info */}
-            <div className="bg-gray-800/50 rounded-lg px-3 py-2.5 text-xs text-gray-500">
-              <p className="font-medium text-gray-400 mb-1">RPM levels tested:</p>
-              <p className="font-mono">5 → 10 → 20 → 30 → 40 → 50 → 60 → 80 → 100</p>
-              <p className="mt-1.5">5 requests per level. Stops when &gt;50% throttled. Estimated time: ~3–6 min.</p>
+            {/* RPM range config */}
+            <div>
+              <label className="block text-xs text-gray-500 mb-2">RPM Range</label>
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  { label: "Start RPM", value: startRpm, set: setStartRpm, min: 1, max: 500 },
+                  { label: "End RPM",   value: endRpm,   set: setEndRpm,   min: 1, max: 500 },
+                  { label: "Step",      value: stepRpm,  set: setStepRpm,  min: 1, max: 100 },
+                ].map(({ label, value, set, min, max }) => (
+                  <div key={label}>
+                    <p className="text-[10px] text-gray-600 mb-1">{label}</p>
+                    <input
+                      type="number"
+                      value={value}
+                      min={min}
+                      max={max}
+                      disabled={running}
+                      onChange={e => set(Math.max(min, Math.min(max, parseInt(e.target.value) || min)))}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-lg px-2.5 py-1.5 text-sm text-gray-300 font-mono text-center focus:outline-none focus:border-gray-600 disabled:opacity-50"
+                    />
+                  </div>
+                ))}
+              </div>
+              {(() => {
+                const rpms = generateRpms(startRpm, endRpm, stepRpm);
+                return (
+                  <div className="mt-2 bg-gray-800/50 rounded-lg px-3 py-2 text-[11px]">
+                    <div className="flex items-center justify-between text-gray-600 mb-1">
+                      <span>{rpms.length} levels · 5 req each · {estimateTime(rpms)} est.</span>
+                      <span className="text-gray-700">stops at &gt;50% throttle</span>
+                    </div>
+                    <p className="font-mono text-gray-500 truncate">
+                      {rpms.length === 0
+                        ? <span className="text-red-500">Invalid range</span>
+                        : rpms.join(" → ")
+                      }
+                    </p>
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* Proxy type */}
+            <div>
+              <label className="block text-xs text-gray-500 mb-2">Proxy / IP Source</label>
+              <div className="grid grid-cols-2 gap-2">
+                {([
+                  { value: "session",     label: "Worker Session",    desc: "Fixed ISP IP (or direct). Same as real polling." },
+                  { value: "rotating_dc", label: "Rotating DC IPs",   desc: "New datacenter IP per request. 40k pool." },
+                ] as const).map(opt => (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    disabled={running}
+                    onClick={() => setProxyType(opt.value)}
+                    className={`text-left px-3 py-2.5 rounded-lg border text-xs transition-colors disabled:opacity-50 ${
+                      proxyType === opt.value
+                        ? "border-purple-600 bg-purple-900/30 text-purple-300"
+                        : "border-gray-700 bg-gray-800/50 text-gray-400 hover:border-gray-600"
+                    }`}
+                  >
+                    <p className="font-medium mb-0.5">{opt.label}</p>
+                    <p className="text-[10px] opacity-70">{opt.desc}</p>
+                  </button>
+                ))}
+              </div>
+              {proxyType === "rotating_dc" && (
+                <p className="text-[11px] text-amber-400 mt-2">
+                  Each request comes from a different datacenter IP. Tests whether rate-limiting is per-IP or per-session.
+                </p>
+              )}
             </div>
 
             {startError && (

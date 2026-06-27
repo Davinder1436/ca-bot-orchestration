@@ -21,20 +21,26 @@ export class RunLogger {
     pipe.set(`run:meta:${this.runId}`, JSON.stringify(meta), "EX", TTL_SECS);
     pipe.zadd(`run:index:${this.accountId}`, Date.now(), this.runId);
     pipe.expire(`run:index:${this.accountId}`, TTL_SECS);
+    // Pointer so dashboard can find the active run without knowing the runId
+    pipe.set(`worker:current-run:${this.accountId}`, this.runId, "EX", TTL_SECS);
     await pipe.exec();
     console.log(`[RunLogger] Run ${this.runId} started for ${this.accountId}`);
   }
 
   async log(message: string, level: "info" | "warn" | "error" = "info") {
     const entry = JSON.stringify({ ts: Date.now(), level, message });
-    await this.redis.rpush(`run:logs:${this.runId}`, entry);
-    await this.redis.expire(`run:logs:${this.runId}`, TTL_SECS);
+    const pipe = this.redis.pipeline();
+    pipe.rpush(`run:logs:${this.runId}`, entry);
+    pipe.expire(`run:logs:${this.runId}`, TTL_SECS);
+    await pipe.exec();
   }
 
-  async logTick(tick: Record<string, unknown>) {
-    const entry = JSON.stringify(tick);
-    await this.redis.rpush(`run:ticks:${this.runId}`, entry);
-    await this.redis.expire(`run:ticks:${this.runId}`, TTL_SECS);
+  async incrementStat(field: "total" | "active" | "empty" | "throttled" | "error") {
+    const key = `run:stats:${this.runId}`;
+    const pipe = this.redis.pipeline();
+    pipe.hincrby(key, field, 1);
+    pipe.expire(key, TTL_SECS);
+    await pipe.exec();
   }
 
   async finalize(status: "stopped" | "crashed", error?: string) {

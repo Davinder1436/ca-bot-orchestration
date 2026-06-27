@@ -46,6 +46,13 @@ export class WorkerManager {
     if (process.env.BRIGHTDATA_ISP_PORT) env.push(`BRIGHTDATA_ISP_PORT=${process.env.BRIGHTDATA_ISP_PORT}`);
     if (process.env.BRIGHTDATA_ISP_USER) env.push(`BRIGHTDATA_ISP_USER=${process.env.BRIGHTDATA_ISP_USER}`);
     if (process.env.BRIGHTDATA_ISP_PASS) env.push(`BRIGHTDATA_ISP_PASS=${process.env.BRIGHTDATA_ISP_PASS}`);
+    // Forward Bright Data DC rotating proxy config — used for rotating IP rate-limit tests
+    if (process.env.BRIGHTDATA_DC_HOST) env.push(`BRIGHTDATA_DC_HOST=${process.env.BRIGHTDATA_DC_HOST}`);
+    if (process.env.BRIGHTDATA_DC_PORT) env.push(`BRIGHTDATA_DC_PORT=${process.env.BRIGHTDATA_DC_PORT}`);
+    if (process.env.BRIGHTDATA_DC_USER) env.push(`BRIGHTDATA_DC_USER=${process.env.BRIGHTDATA_DC_USER}`);
+    if (process.env.BRIGHTDATA_DC_PASS) env.push(`BRIGHTDATA_DC_PASS=${process.env.BRIGHTDATA_DC_PASS}`);
+    if (process.env.GROQ_API_KEY)   env.push(`GROQ_API_KEY=${process.env.GROQ_API_KEY}`);
+    if (process.env.OPENAI_API_KEY) env.push(`OPENAI_API_KEY=${process.env.OPENAI_API_KEY}`);
 
     const container = await this.docker.createContainer({
       Image: WORKER_IMAGE,

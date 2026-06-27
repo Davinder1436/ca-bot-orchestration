@@ -56,6 +56,7 @@ const STATUS_COLOR: Record<string, string> = {
 
 type Tab = "info" | "browser" | "console" | "logs" | "captcha";
 type LogLine = { ts: string; msg: string; color: string };
+type CaptchaTiles = { attempt: number; question: string; r1: string; r2: string; r3: string };
 type ConsoleMsg = { level: string; text: string; ts: number };
 
 function parseLogLine(raw: string): LogLine | null {
@@ -148,11 +149,22 @@ export function WorkerDetailPanel({ account, liveStatus, onClose, onEdit, onDele
 
   // ── Docker logs ───────────────────────────────────────────────
   const [dockerLines, setDockerLines] = useState<LogLine[]>([]);
+  const [captchaAttempts, setCaptchaAttempts] = useState<CaptchaTiles[]>([]);
   const [logsConnected, setLogsConnected] = useState(false);
   const [logsSource, setLogsSource] = useState<"none" | "history" | "live">("none");
   const [logsAutoScroll, setLogsAutoScroll] = useState(true);
 
   const appendDockerLine = useCallback((raw: string) => {
+    const clean = stripAnsi(raw);
+    const { msg } = splitTimestamp(clean);
+    // Intercept tile images before they hit the text log — store separately for visual rendering
+    if (msg.startsWith("[Captcha:tiles] ")) {
+      try {
+        const data = JSON.parse(msg.slice("[Captcha:tiles] ".length)) as CaptchaTiles;
+        setCaptchaAttempts(p => [...p, data]);
+      } catch {}
+      return;
+    }
     const line = parseLogLine(raw);
     if (line) setDockerLines(p => [...p.slice(-499), line]);
   }, []);
@@ -164,8 +176,20 @@ export function WorkerDetailPanel({ account, liveStatus, onClose, onEdit, onDele
     fetch(`/api/workers/${account.id}/logs/history`)
       .then(r => r.ok ? r.json() : [])
       .then((rawLines: string[]) => {
-        const parsed = rawLines.map(parseLogLine).filter((l): l is LogLine => l !== null);
+        const tiles: CaptchaTiles[] = [];
+        const parsed: LogLine[] = [];
+        for (const raw of rawLines) {
+          const clean = stripAnsi(raw);
+          const { msg } = splitTimestamp(clean);
+          if (msg.startsWith("[Captcha:tiles] ")) {
+            try { tiles.push(JSON.parse(msg.slice("[Captcha:tiles] ".length)) as CaptchaTiles); } catch {}
+            continue;
+          }
+          const line = parseLogLine(raw);
+          if (line) parsed.push(line);
+        }
         setDockerLines(parsed);
+        setCaptchaAttempts(tiles);
         setLogsSource(parsed.length > 0 ? "history" : "none");
       })
       .catch(() => {});
@@ -175,6 +199,7 @@ export function WorkerDetailPanel({ account, liveStatus, onClose, onEdit, onDele
   useEffect(() => {
     if (!isRunning) return;
     setDockerLines([]);
+    setCaptchaAttempts([]);
     setLogsSource("live");
     const es = new EventSource(`/api/workers/${account.id}/logs`);
     es.onopen = () => setLogsConnected(true);
@@ -277,20 +302,14 @@ export function WorkerDetailPanel({ account, liveStatus, onClose, onEdit, onDele
   const session = details?.sessions[0];
   const containerId = details?.containerId ?? session?.containerId;
 
-  // Captcha-related lines filtered from the Docker log stream
-  // [Captcha:img] lines carry the screenshot data URI — rendered as images, not text
-  const allCaptchaLines = dockerLines.filter(l => /\[Captcha/i.test(l.msg));
-  const captchaLines    = allCaptchaLines.filter(l => !l.msg.startsWith("[Captcha:img]"));
-  const captchaImgLines = allCaptchaLines.filter(l => l.msg.startsWith("[Captcha:img]"));
-  const latestCaptchaImg = captchaImgLines.length > 0
-    ? captchaImgLines[captchaImgLines.length - 1].msg.slice("[Captcha:img] ".length)
-    : null;
+  // Captcha text logs — [Captcha:tiles] lines are intercepted before reaching dockerLines
+  const captchaLines = dockerLines.filter(l => /\[Captcha/i.test(l.msg));
 
   const tabs: { id: Tab; label: string; icon: React.ComponentType<{ className?: string }>; badge?: number }[] = [
     { id: "info",    label: "Info",            icon: Info },
     { id: "browser", label: "Live View",       icon: Monitor },
     { id: "console", label: "Browser Console", icon: Terminal },
-    { id: "captcha", label: "Captcha",         icon: ShieldAlert, badge: allCaptchaLines.length > 0 ? captchaLines.length : undefined },
+    { id: "captcha", label: "Captcha",         icon: ShieldAlert, badge: captchaAttempts.length > 0 ? captchaAttempts.length : undefined },
     { id: "logs",    label: "Logs",            icon: FileText },
   ];
 
@@ -611,40 +630,47 @@ export function WorkerDetailPanel({ account, liveStatus, onClose, onEdit, onDele
                   <ShieldAlert className="w-3.5 h-3.5 text-purple-400" />
                   Captcha solver
                   {captchaLines.length > 0 && ` · ${captchaLines.length} log lines`}
-                  {captchaImgLines.length > 0 && ` · ${captchaImgLines.length} screenshot${captchaImgLines.length > 1 ? "s" : ""}`}
+                  {captchaAttempts.length > 0 && ` · ${captchaAttempts.length} attempt${captchaAttempts.length > 1 ? "s" : ""}`}
                 </span>
                 <span className={`flex items-center gap-1 text-[10px] ${
-                  logsConnected ? "text-green-500" : allCaptchaLines.length > 0 ? "text-yellow-600" : "text-gray-700"
+                  logsConnected ? "text-green-500" : captchaLines.length > 0 || captchaAttempts.length > 0 ? "text-yellow-600" : "text-gray-700"
                 }`}>
                   {isRunning
                     ? logsConnected
                       ? <><Wifi className="w-3 h-3" /> Live</>
                       : <><WifiOff className="w-3 h-3" /> Connecting…</>
-                    : allCaptchaLines.length > 0
+                    : captchaLines.length > 0 || captchaAttempts.length > 0
                       ? <><History className="w-3 h-3" /> Saved</>
                       : "No activity"}
                 </span>
               </div>
 
-              {/* Latest captcha screenshot */}
-              {latestCaptchaImg && (
-                <div className="shrink-0 rounded-xl border border-purple-900/40 bg-black/30 overflow-hidden">
-                  <div className="flex items-center justify-between px-3 py-1.5 border-b border-purple-900/30">
-                    <span className="text-[10px] text-purple-400 font-medium flex items-center gap-1.5">
-                      <Camera className="w-3 h-3" />
-                      Screenshot sent to solver
-                      {captchaImgLines.length > 1 && (
-                        <span className="text-purple-600">· attempt {captchaImgLines.length}</span>
-                      )}
-                    </span>
-                  </div>
-                  <div className="flex justify-center p-3 bg-black/20">
-                    <img
-                      src={latestCaptchaImg}
-                      alt="Captcha challenge"
-                      className="max-h-52 rounded-lg border border-gray-800 shadow-xl object-contain"
-                    />
-                  </div>
+              {/* Captcha tile grids — all attempts accumulated, newest at bottom */}
+              {captchaAttempts.length > 0 && (
+                <div className="overflow-y-auto space-y-2 max-h-72 shrink-0">
+                  {captchaAttempts.map((att, i) => (
+                    <div key={i} className="rounded-xl border border-purple-900/40 bg-black/30 overflow-hidden">
+                      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-purple-900/30">
+                        <Camera className="w-3 h-3 text-purple-400 shrink-0" />
+                        <span className="text-[10px] text-purple-400 font-medium shrink-0">
+                          Attempt {att.attempt}
+                        </span>
+                        {att.question && (
+                          <span className="text-[10px] text-purple-600 italic truncate">— "{att.question}"</span>
+                        )}
+                      </div>
+                      <div className="flex gap-1 p-2 bg-black/20">
+                        {[att.r1, att.r2, att.r3].map((src, ri) => (
+                          <img
+                            key={ri}
+                            src={src}
+                            alt={`Row ${ri + 1}`}
+                            className="flex-1 min-w-0 rounded border border-gray-800 object-contain"
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  ))}
                 </div>
               )}
 
@@ -658,7 +684,7 @@ export function WorkerDetailPanel({ account, liveStatus, onClose, onEdit, onDele
                     <div className="space-y-1">
                       <ShieldAlert className="w-8 h-8 mx-auto opacity-20 text-purple-400" />
                       <p>{isRunning ? "Waiting for captcha activity…" : "No captcha logs yet"}</p>
-                      <p className="text-[10px] text-gray-700 mt-1">Screenshot and solver steps appear here when a captcha is encountered</p>
+                      <p className="text-[10px] text-gray-700 mt-1">Row images and solver steps appear here when a captcha is encountered</p>
                     </div>
                   }
                 />

@@ -13,6 +13,36 @@ import { createRouter } from "./api/routes";
 const PORT = parseInt(process.env.PORT ?? "3000");
 const REDIS_URL = process.env.REDIS_URL!;
 
+// On orchestrator startup, reset all non-idle account states and close open sessions.
+// A compose restart kills every worker container without a graceful shutdown, leaving
+// accounts stuck in POLLING/STARTING/etc. Since no containers survive a restart,
+// any non-IDLE state is guaranteed stale.
+async function resetStaleState(db: PrismaClient, redis: Redis) {
+  const stale = await db.account.findMany({
+    where: { status: { notIn: ["IDLE"] } },
+    select: { id: true, status: true },
+  });
+
+  if (stale.length === 0) return;
+
+  console.log(`[Orchestrator] Resetting ${stale.length} stale account(s) to IDLE on startup`);
+
+  await db.account.updateMany({
+    where: { status: { notIn: ["IDLE"] } },
+    data: { status: "IDLE" },
+  });
+
+  await db.workerSession.updateMany({
+    where: { endedAt: null },
+    data: { status: "STOPPED", endedAt: new Date() },
+  });
+
+  // Clear Redis heartbeat keys so HealthMonitor doesn't consider them alive
+  for (const acc of stale) {
+    await redis.del(`worker:heartbeat:${acc.id}`).catch(() => {});
+  }
+}
+
 async function main() {
   const db = new PrismaClient();
   await db.$connect();
@@ -24,6 +54,8 @@ async function main() {
 
   const bus = new EventBus(REDIS_URL);
   await bus.connect();
+
+  await resetStaleState(db, redis);
 
   const workerManager = new WorkerManager(REDIS_URL, db, bus, redis);
   const healthMonitor = new HealthMonitor(redis, db, workerManager);

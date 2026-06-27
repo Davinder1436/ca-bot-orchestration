@@ -24,7 +24,7 @@ const VIEWPORTS = [
 
 // Chrome's --proxy-server flag does not accept credentials in the URL.
 // Parse the URL and pass credentials via Playwright's native proxy option instead.
-function parseProxyUrl(url: string): { server: string; username?: string; password?: string } {
+export function parseProxyUrl(url: string): { server: string; username?: string; password?: string } {
   const parsed = new URL(url);
   const server = `${parsed.protocol}//${parsed.host}`;
   const username = parsed.username ? decodeURIComponent(parsed.username) : undefined;

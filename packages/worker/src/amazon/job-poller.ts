@@ -1,5 +1,7 @@
+import { chromium } from "playwright";
 import type { Page } from "playwright";
 import type Redis from "ioredis";
+import { parseProxyUrl } from "../browser/launch";
 import type { EventBus } from "../events/event-bus";
 import type { RunLogger } from "../RunLogger";
 
@@ -15,6 +17,7 @@ export interface JobPollerConfig {
   intervalMs?: number;
   runLogger?: RunLogger;
   redis?: Redis;
+  rotatingDcProxyUrl?: string;
 }
 
 interface Schedule {
@@ -40,11 +43,9 @@ interface PageFetchResult {
 const DOMAIN = (country: "CA" | "US") =>
   country === "CA" ? "hiring.amazon.ca" : "hiring.amazon.com";
 
-const DEFAULT_INTERVAL_MS = 5_000;
-const PEAK_INTERVAL_MS    = 2_000; // 5:55–6:10 AM
+const DEFAULT_INTERVAL_MS = 334;   // ~180 RPM
+const PEAK_INTERVAL_MS    = 300;   // ~200 RPM — 5:55–6:10 AM
 const MAX_BACKOFF_MS      = 60_000;
-const JOB_STAGGER_MIN_MS  = 1_500;
-const JOB_STAGGER_RANGE_MS= 1_500;
 
 export class JobPoller {
   private running = false;
@@ -56,7 +57,12 @@ export class JobPoller {
 
   async start() {
     this.running = true;
+    const interval0 = this.config.intervalMs ?? DEFAULT_INTERVAL_MS;
     console.log(`[Poller:${this.config.email}] Starting poll loop for ${this.config.jobIds.length} jobs via browser fetch`);
+    await this.config.runLogger?.log(
+      `Poll loop started — ${this.config.jobIds.length} job(s), interval=${interval0}ms (~${Math.round(60_000 / interval0)} RPM)`,
+      "info"
+    ).catch(() => {});
 
     const warmupEnd = Date.now() + 2 * 60_000;
 
@@ -76,6 +82,7 @@ export class JobPoller {
     }
 
     console.log(`[Poller:${this.config.email}] Poll loop stopped`);
+    await this.config.runLogger?.log(`Poll loop stopped`, "info").catch(() => {});
   }
 
   stop() { this.running = false; }
@@ -89,10 +96,9 @@ export class JobPoller {
   }
 
   setIntervalMs(ms: number) {
-    const n = this.config.jobIds.length;
-    const minSafe = Math.max(500, Math.ceil((n * 60_000) / 100));
+    const minSafe = 300; // floor at 200 RPM
     this.config.intervalMs = Math.max(ms, minSafe);
-    console.log(`[Poller:${this.config.email}] Interval → ${this.config.intervalMs}ms (requested ${ms}ms, floor ${minSafe}ms for ${n} jobs)`);
+    console.log(`[Poller:${this.config.email}] Interval → ${this.config.intervalMs}ms (~${Math.round(60_000 / this.config.intervalMs)} RPM, requested ${ms}ms)`);
   }
 
   private async pollOnce(isWarmup: boolean, intervalMs: number) {
@@ -114,6 +120,7 @@ export class JobPoller {
       } catch (err) {
         const durationMs = Date.now() - start;
         const msg = err instanceof Error ? err.message : String(err);
+        await this.config.runLogger?.log(`Poll error on ${jobId}: ${msg}`, "error").catch(() => {});
         await this.emitTick({ jobId, result: "error", error: msg, statusCode: undefined, durationMs, isWarmup, intervalMs }).catch(() => {});
         throw err;
       }
@@ -122,7 +129,7 @@ export class JobPoller {
       this.trackTick();
 
       if (result.status === 401) {
-        // Emit then let handleError trigger re-login via session:expired
+        await this.config.runLogger?.log(`Session expired (401) on ${jobId} — re-login triggered`, "warn").catch(() => {});
         await this.emitTick({ jobId, result: "error", error: "401 session expired", statusCode: 401, durationMs, isWarmup, intervalMs }).catch(() => {});
         this.running = false;
         await this.bus.publish("session:expired", { accountId: this.config.accountId, email: this.config.email });
@@ -134,6 +141,7 @@ export class JobPoller {
         this.backoffMultiplier = Math.min(this.backoffMultiplier * 2, 8);
         const wait = Math.min(5_000 * this.backoffMultiplier, MAX_BACKOFF_MS);
         console.warn(`[Poller:${this.config.email}] ${result.status} throttled — backing off ${wait}ms (×${this.backoffMultiplier})`);
+        await this.config.runLogger?.log(`Throttled (${result.status}) on ${jobId} — backing off ${wait}ms (×${this.backoffMultiplier})`, "warn").catch(() => {});
         await sleep(wait);
         continue;
       }
@@ -145,6 +153,7 @@ export class JobPoller {
           this.backoffMultiplier = Math.min(this.backoffMultiplier * 2, 8);
           const wait = Math.min(10_000 * this.backoffMultiplier, MAX_BACKOFF_MS);
           console.warn(`[Poller:${this.config.email}] CloudFront block — waiting ${wait}ms`);
+          await this.config.runLogger?.log(`CloudFront block on ${jobId} — waiting ${wait}ms (×${this.backoffMultiplier})`, "warn").catch(() => {});
           await sleep(wait);
         }
         continue;
@@ -188,6 +197,10 @@ export class JobPoller {
 
       if (active.length > 0) {
         for (const schedule of active) {
+          await this.config.runLogger?.log(
+            `JOB FOUND: ${jobId} scheduleId=${schedule.scheduleId} slots=${schedule.laborDemandAvailableCount}`,
+            "info"
+          ).catch(() => {});
           await this.captureJob(jobId, schedule);
         }
         this.consecutiveEmpty = 0;
@@ -195,12 +208,19 @@ export class JobPoller {
         this.consecutiveEmpty++;
       }
 
+      // Adaptive stagger: space jobs within a cycle at the same interval as the cycle itself.
+      // This keeps total RPM = 60000/intervalMs regardless of how many jobs are monitored.
       if (this.running && jobId !== this.config.jobIds[this.config.jobIds.length - 1]) {
-        await sleep(JOB_STAGGER_MIN_MS + Math.random() * JOB_STAGGER_RANGE_MS);
+        const stagger = Math.max(200, Math.min(2_000, intervalMs));
+        await sleep(stagger * (0.9 + Math.random() * 0.2));
       }
     }
 
     if (this.consecutiveEmpty > 100) {
+      await this.config.runLogger?.log(
+        `Possible shadow ban — ${this.consecutiveEmpty} consecutive empty responses`,
+        "warn"
+      ).catch(() => {});
       await this.bus.publish("account:possible_shadow_ban", {
         accountId: this.config.accountId,
         email: this.config.email,
@@ -213,11 +233,11 @@ export class JobPoller {
   // Run fetch() inside the Playwright browser page — this sends session cookies
   // automatically (credentials: 'include'), exactly like the old Chrome extension did
   // via chrome.scripting.executeScript with world: 'MAIN'.
-  private async browserFetch(url: string, body: object): Promise<PageFetchResult> {
-    const page = this.config.page;
+  private async browserFetch(url: string, body: object, page?: Page): Promise<PageFetchResult> {
+    const targetPage = page ?? this.config.page;
     const token = this.config.accessToken;
 
-    const result = await page.evaluate(
+    const result = await targetPage.evaluate(
       async ({ url, body, token }) => {
         try {
           const resp = await fetch(url, {
@@ -271,7 +291,8 @@ export class JobPoller {
 
   // Run an escalating RPM rate-limit test from within this browser session.
   // Uses the same browserFetch as real polling, so results reflect actual limits.
-  async runRateLimitTest(testId: string, jobId: string, rpms: number[]) {
+  // Accepts an optional page override for the rotating proxy test.
+  async runRateLimitTest(testId: string, jobId: string, rpms: number[], page?: Page) {
     const domain = DOMAIN(this.config.country);
     const locale = this.config.country === "CA" ? "en-CA" : "en-US";
     const url    = `https://${domain}/application/api/job/get-all-schedules/${jobId}`;
@@ -314,7 +335,7 @@ export class JobPoller {
         await log(`→ req ${i + 1}/${REQUESTS}  POST ${url.replace(/^https:\/\/[^/]+/, "")}`, "info");
         const start = Date.now();
         try {
-          const r = await this.browserFetch(url, body);
+          const r = await this.browserFetch(url, body, page);
           const ms = Date.now() - start;
           latencies.push(ms);
 
@@ -384,6 +405,83 @@ export class JobPoller {
     }
   }
 
+  // Rotating DC proxy test — spins up a separate Chromium instance with the
+  // datacenter rotating proxy, copies session cookies from the main browser,
+  // and runs the same RPM escalation. Each request comes from a different
+  // datacenter IP so the results show whether rate-limiting is per-IP or per-session.
+  async runRotatingProxyTest(testId: string, jobId: string, rpms: number[]) {
+    const rotatingUrl = this.config.rotatingDcProxyUrl;
+    const redis = this.config.redis;
+
+    const log = async (message: string, level: "info" | "warn" | "success" | "error") => {
+      console.log(`[RotatingTest:${testId}] ${message}`);
+      await this.bus.publish("test:log", { testId, message, level, timestamp: Date.now() });
+      if (redis) {
+        const entry = JSON.stringify({ ts: Date.now(), level, message });
+        redis.rpush(`test:logs:${testId}`, entry).catch(() => {});
+        redis.expire(`test:logs:${testId}`, TEST_LOG_TTL).catch(() => {});
+      }
+    };
+
+    if (!rotatingUrl) {
+      await log("No rotating DC proxy configured (BRIGHTDATA_DC_* env vars missing)", "error");
+      await this.bus.publish("test:complete", { testId, phases: [] });
+      return;
+    }
+
+    await log(`Rotating DC proxy test — launching isolated browser with rotating IPs`, "info");
+    await log(`Proxy: ${rotatingUrl.replace(/:([^@]+)@/, ":***@")}`, "info");
+
+    // Copy cookies from the authenticated main browser session
+    const cookies = await this.config.page.context().cookies();
+    await log(`Copied ${cookies.length} session cookies from main browser`, "info");
+
+    const domain = DOMAIN(this.config.country);
+
+    // Launch an isolated browser that routes through the rotating DC proxy.
+    // No session ID in the username → Bright Data assigns a fresh IP per TCP connection.
+    const proxy = parseProxyUrl(rotatingUrl);
+    const browser = await chromium.launch({
+      headless: false,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+      ],
+      proxy,
+    });
+
+    try {
+      const context = await browser.newContext({
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        locale: "en-CA",
+        timezoneId: this.config.country === "CA" ? "America/Toronto" : "America/New_York",
+      });
+
+      // Import the authenticated session cookies into the rotating browser
+      await context.addCookies(cookies);
+
+      const page = await context.newPage();
+      await log(`Navigating to Amazon hiring portal via rotating proxy...`, "info");
+
+      try {
+        await page.goto(`https://${domain}/app#/jobSearch`, { waitUntil: "domcontentloaded", timeout: 30_000 });
+        await log(`Navigation OK — running escalating RPM test`, "info");
+      } catch (e) {
+        await log(`Navigation failed: ${e instanceof Error ? e.message : e} — cookies may be IP-bound`, "error");
+        await this.bus.publish("test:complete", { testId, phases: [] });
+        return;
+      }
+
+      // Delegate to the same core test runner (with the rotating page)
+      await this.runRateLimitTest(testId, jobId, rpms, page);
+    } finally {
+      await browser.close();
+      await log("Rotating proxy browser closed", "info");
+    }
+  }
+
   private async handleError(err: unknown) {
     console.error(`[Poller:${this.config.email}] Poll error:`, err);
   }
@@ -395,9 +493,7 @@ export class JobPoller {
     const m    = now.getMinutes();
     const isPeak = (h === 5 && m >= 55) || (h === 6 && m <= 10);
     if (isPeak) return PEAK_INTERVAL_MS;
-    const n = this.config.jobIds.length;
-    const minInterval = Math.ceil((n * 60_000) / 80);
-    return Math.max(base, minInterval);
+    return Math.max(base, 300); // floor: 300ms = 200 RPM max
   }
 
   private trackTick() {
@@ -439,7 +535,11 @@ export class JobPoller {
       timestamp:    Date.now(),
     };
     await this.bus.publish("poll:tick", tick);
-    await this.config.runLogger?.logTick(tick).catch(() => {});
+    const rl = this.config.runLogger;
+    if (rl) {
+      rl.incrementStat("total").catch(() => {});
+      rl.incrementStat(fields.result).catch(() => {});
+    }
   }
 }
 

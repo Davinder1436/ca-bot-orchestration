@@ -1,8 +1,10 @@
 import type { Page } from "playwright";
 import axios from "axios";
 
-const CAPTCHA_BACKEND = process.env.CAPTCHA_BACKEND_URL ?? "http://localhost:8000";
-const MAX_ATTEMPTS = 3;
+const GROQ_API_KEY = process.env.GROQ_API_KEY ?? "";
+const GROQ_MODEL   = "meta-llama/llama-4-scout-17b-16e-instruct";
+const MAX_ATTEMPTS = 10;
+const CONFIDENCE_THRESHOLD = 0.5;
 
 const tag = (email: string) => `[Captcha:${email}]`;
 
@@ -15,7 +17,7 @@ function isUsableQuestion(q: string): boolean {
 }
 
 export async function solveCaptchaOnPage(page: Page, accountEmail: string): Promise<void> {
-  console.log(`${tag(accountEmail)} Starting solver — backend: ${CAPTCHA_BACKEND}`);
+  console.log(`${tag(accountEmail)} Starting solver — Groq Scout (${GROQ_MODEL})`);
 
   let persistedQuestion = "";
 
@@ -26,16 +28,17 @@ export async function solveCaptchaOnPage(page: Page, accountEmail: string): Prom
     }
 
     console.log(`${tag(accountEmail)} ── Attempt ${attempt}/${MAX_ATTEMPTS} ──`);
+    const attemptStart = Date.now();
+    let screenshotMs = 0, aiMs = 0, clicksMs = 0;
 
     // Wait for the captcha dialog to be visible in the DOM, then immediately screenshot.
-    // No static sleeps — we fire as soon as the heading text appears.
     await waitForCaptchaReady(page, accountEmail);
 
-    const screenshotBuffer = await takeCroppedScreenshot(page, accountEmail);
-    const imageBase64 = `data:image/jpeg;base64,${screenshotBuffer.toString("base64")}`;
-    console.log(`${tag(accountEmail)} Screenshot: ${Math.round(screenshotBuffer.length / 1024)}KB`);
-    // Dashboard captcha tab renders this as <img>
-    console.log(`[Captcha:img] ${imageBase64}`);
+    const screenshotStart = Date.now();
+    const rowBuffers = await takeRowScreenshots(page, accountEmail);
+    const imageBase64s = rowBuffers.map(b => `data:image/jpeg;base64,${b.toString("base64")}`);
+    screenshotMs = Date.now() - screenshotStart;
+    console.log(`${tag(accountEmail)} Screenshots: ${rowBuffers.map(b => `${Math.round(b.length / 1024)}KB`).join("+")} (${screenshotMs}ms)`);
 
     // Extract question from DOM / shadow DOM
     const rawQuestion = await extractQuestion(page);
@@ -44,36 +47,50 @@ export async function solveCaptchaOnPage(page: Page, accountEmail: string): Prom
     const question = persistedQuestion || "Choose all matching tiles";
     console.log(`${tag(accountEmail)} Using question: "${question}"`);
 
+    // Emit tile images to dashboard — rendered as visual tile grid, NOT raw base64 in text logs
+    console.log(`[Captcha:tiles] ${JSON.stringify({ attempt, question, r1: imageBase64s[0], r2: imageBase64s[1], r3: imageBase64s[2] })}`);
+
     // Detect grid size
     const { rows, cols } = await detectGrid(page);
     console.log(`${tag(accountEmail)} Grid: ${rows}×${cols}`);
 
-    // Send to captcha backend
+    // Groq vision API — Scout scores each tile with a confidence value
     let tiles: Array<{ row: number; column: number }> = [];
+    const aiCallStart = Date.now();
     try {
-      console.log(`${tag(accountEmail)} → POST ${CAPTCHA_BACKEND}/solve-captcha`);
+      console.log(`${tag(accountEmail)} → Groq Scout (confidence mode)`);
       const resp = await axios.post(
-        `${CAPTCHA_BACKEND}/solve-captcha`,
-        { imageBase64, question, rows, cols },
-        { timeout: 60_000 }
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+          model: GROQ_MODEL,
+          max_tokens: 512,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "text",      text: buildCaptchaPrompt(question, rows, cols) },
+              { type: "image_url", image_url: { url: imageBase64s[0] } },
+              { type: "image_url", image_url: { url: imageBase64s[1] } },
+              { type: "image_url", image_url: { url: imageBase64s[2] } },
+            ],
+          }],
+        },
+        {
+          headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
+          timeout: 15_000,
+        }
       );
-      console.log(`${tag(accountEmail)} ← HTTP ${resp.status} solver=${resp.data.solver ?? "?"} success=${resp.data.success}`);
-      if (resp.data.modelRaw) {
-        console.log(`${tag(accountEmail)} [LLM response] ${resp.data.modelRaw}`);
-      }
-      if (resp.data.success) {
-        tiles = resp.data.tiles ?? [];
-        console.log(`${tag(accountEmail)} Tiles to click: ${JSON.stringify(tiles)}`);
-      } else {
-        console.warn(`${tag(accountEmail)} Backend success=false: ${resp.data.error ?? "unknown"}`);
-      }
+      aiMs = Date.now() - aiCallStart;
+      const raw = (resp.data.choices?.[0]?.message?.content as string | undefined)?.trim() ?? "";
+      console.log(`${tag(accountEmail)} ← Groq ${aiMs}ms raw: ${raw}`);
+      tiles = parseTileConfidences(raw, rows, cols, accountEmail);
+      console.log(`${tag(accountEmail)} Selected tiles: ${JSON.stringify(tiles)}`);
     } catch (err: unknown) {
-      const msg    = err instanceof Error ? err.message : String(err);
-      const status = axios.isAxiosError(err) ? err.response?.status : undefined;
-      const body   = axios.isAxiosError(err) ? JSON.stringify(err.response?.data).slice(0, 200) : "";
-      console.error(`${tag(accountEmail)} Backend FAILED: ${msg}${status ? ` (HTTP ${status})` : ""}${body ? ` — ${body}` : ""}`);
+      aiMs = Date.now() - aiCallStart;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`${tag(accountEmail)} Groq FAILED ${aiMs}ms: ${msg}`);
     }
 
+    const clicksStart = Date.now();
     if (tiles.length === 0) {
       console.warn(`${tag(accountEmail)} No tiles returned — skipping clicks`);
     } else {
@@ -81,9 +98,11 @@ export async function solveCaptchaOnPage(page: Page, accountEmail: string): Prom
       for (const tile of tiles) {
         const ok = await clickGridTile(page, tile.row, tile.column, rows, cols);
         console.log(`${tag(accountEmail)}   tile (row=${tile.row} col=${tile.column}) → ${ok ? "clicked" : "missed"}`);
-        await sleep(250 + Math.random() * 300);
+        // clickGridTile already does a double-rAF per tile; one final flush before submit
       }
+      await page.evaluate(() => new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r()))));
     }
+    clicksMs = Date.now() - clicksStart;
 
     // Click Confirm — button lives inside shadow DOM so page.locator() can't find it.
     console.log(`${tag(accountEmail)} Clicking submit...`);
@@ -108,42 +127,93 @@ export async function solveCaptchaOnPage(page: Page, accountEmail: string): Prom
       return false;
     });
     console.log(`${tag(accountEmail)} Submit: ${submitted ? "clicked" : "button not found"}`);
-    await sleep(2_500);
 
-    const stillVisible = await captchaVisible(page);
-    if (!stillVisible) {
-      console.log(`${tag(accountEmail)} ✓ SOLVED on attempt ${attempt}`);
+    // Wait for actual browser outcome — no static sleep
+    const submitResult = await waitForSubmitResult(page, accountEmail);
+    const postMs = Date.now() - clicksStart - clicksMs;
+    const totalMs = Date.now() - attemptStart;
+    console.log(
+      `[Captcha:timing] attempt=${attempt} screenshot=${screenshotMs}ms AI=${aiMs}ms clicks=${clicksMs}ms post=${postMs}ms total=${totalMs}ms result=${submitResult}`
+    );
+
+    if (submitResult === "solved") {
+      console.log(`${tag(accountEmail)} ✓ SOLVED on attempt ${attempt} (${totalMs}ms)`);
       return;
     }
-    console.warn(`${tag(accountEmail)} Still visible after attempt ${attempt} — retrying`);
+    console.warn(`${tag(accountEmail)} Attempt ${attempt} ${submitResult} — retrying`);
 
     if (attempt < MAX_ATTEMPTS) {
-      await page.evaluate(() => {
-        const RETRY_TEXTS = ["try again", "new challenge", "reload", "refresh"];
-        function findRetry(root: Document | ShadowRoot): HTMLButtonElement | null {
-          for (const el of Array.from(root.querySelectorAll("*"))) {
-            const s = (el as Element & { shadowRoot?: ShadowRoot }).shadowRoot;
-            if (s) { const f = findRetry(s); if (f) return f; }
-          }
-          for (const btn of Array.from(root.querySelectorAll("button, [role='button']"))) {
-            const text = btn.textContent?.trim().toLowerCase() ?? "";
-            if (RETRY_TEXTS.some(t => text.includes(t))) return btn as HTMLButtonElement;
-          }
-          return null;
-        }
-        const btn = findRetry(document);
-        if (btn) btn.click();
-      }).catch(() => {});
-      await sleep(1_500);
+      // Wait for "Incorrect" text to appear, click new challenge, then wait for it to clear
+      await waitForNewChallenge(page, accountEmail);
     }
   }
 
   throw new Error(`[Captcha] FAILED after ${MAX_ATTEMPTS} attempts — stopping worker`);
 }
 
+// ─── Prompt ───────────────────────────────────────────────────────────────────
+
+function buildCaptchaPrompt(question: string, rows: number, cols: number): string {
+  const rowLabels = Array.from({ length: rows }, (_, i) =>
+    `  Image ${i + 1} = Row ${i + 1} (${i === 0 ? "top" : i === rows - 1 ? "bottom" : "middle"})`
+  ).join("\n");
+  return `You are solving an Amazon image verification challenge.
+
+The captcha shows a ${rows}×${cols} grid. I am sending ${rows} separate images — one per row:
+${rowLabels}
+
+Each image shows ${cols} tiles side by side: column 1 = left, column ${cols} = right.
+
+Task: "${question}"
+
+For EVERY tile in all ${rows} images, rate your confidence that the target object is present in that tile.
+Use a float from 0.0 (definitely absent) to 1.0 (definitely present).
+
+Reply with ONLY a JSON array of exactly ${rows * cols} objects — no explanation, no markdown:
+[
+  {"row":1,"column":1,"confidence":0.95},
+  {"row":1,"column":2,"confidence":0.05},
+  {"row":1,"column":3,"confidence":0.8},
+  {"row":2,"column":1,"confidence":0.0},
+  ...
+]`;
+}
+
+// ─── Parse confidence response ────────────────────────────────────────────────
+// Selects tiles where confidence >= CONFIDENCE_THRESHOLD and logs all scores.
+
+function parseTileConfidences(
+  raw: string,
+  rows: number,
+  cols: number,
+  email: string,
+): Array<{ row: number; column: number }> {
+  const text  = raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```$/m, "").trim();
+  const match = text.match(/\[[\s\S]*?\]/);
+  if (!match) return [];
+  try {
+    const parsed = JSON.parse(match[0]) as unknown[];
+    if (!Array.isArray(parsed)) return [];
+
+    type Entry = { row: number; column: number; confidence: number };
+    const entries = (parsed as Array<{ row: unknown; column: unknown; confidence: unknown }>)
+      .filter(t =>
+        typeof t.row === "number" && typeof t.column === "number" && typeof t.confidence === "number" &&
+        (t.row as number) >= 1 && (t.row as number) <= rows &&
+        (t.column as number) >= 1 && (t.column as number) <= cols
+      ) as Entry[];
+
+    // Log every score so we can tune the threshold from logs
+    const scoreLog = entries.map(e => `(${e.row},${e.column})=${e.confidence.toFixed(2)}`).join(" ");
+    console.log(`${tag(email)} Confidence scores: ${scoreLog}`);
+
+    return entries
+      .filter(e => e.confidence >= CONFIDENCE_THRESHOLD)
+      .map(({ row, column }) => ({ row, column }));
+  } catch { return []; }
+}
+
 // ─── Wait for captcha dialog to appear ───────────────────────────────────────
-// Fires the instant "Let's confirm you are human" appears anywhere in the DOM
-// (including shadow roots). No static sleep.
 async function waitForCaptchaReady(page: Page, email: string): Promise<void> {
   console.log(`${tag(email)} Waiting for captcha heading in DOM...`);
   await page.waitForFunction(
@@ -166,58 +236,24 @@ async function waitForCaptchaReady(page: Page, email: string): Promise<void> {
   console.log(`${tag(email)} Captcha heading detected`);
 }
 
-// ─── Take cropped screenshot via Chrome extension captureVisibleTab ───────────
-// Content scripts run in an isolated JS world so window.__captureTab is not
-// directly accessible from page.evaluate (main world). We use a postMessage
-// bridge: page sends { __action: 'captureTab', __id } and content.js replies
-// with { __captureTabResult: id, imageData } — GPU-composited, all 9 tiles.
-// Fallback: page.screenshot() crop (grey rows 2-3 likely; last resort).
-async function takeCroppedScreenshot(page: Page, email: string): Promise<Buffer> {
-  try {
-    const dataUrl: string | null = await page.evaluate(() =>
-      new Promise<string | null>((resolve) => {
-        const reqId = Math.random().toString(36).slice(2);
-
-        const timer = setTimeout(() => {
-          window.removeEventListener("message", onMsg);
-          resolve(null);
-        }, 12_000);
-
-        function onMsg(ev: MessageEvent) {
-          if (ev.data?.__captureTabResult !== reqId) return;
-          clearTimeout(timer);
-          window.removeEventListener("message", onMsg);
-          resolve((ev.data.imageData as string | null) ?? null);
-        }
-
-        window.addEventListener("message", onMsg);
-        window.postMessage({ __action: "captureTab", __id: reqId }, "*");
-      })
-    );
-
-    if (dataUrl && dataUrl.startsWith("data:image/")) {
-      const b64 = dataUrl.replace(/^data:image\/[^;]+;base64,/, "");
-      const buf = Buffer.from(b64, "base64");
-      console.log(`${tag(email)} captureVisibleTab: ${Math.round(buf.length / 1024)}KB ✓`);
-      return buf;
-    }
-    console.warn(`${tag(email)} captureVisibleTab returned null — extension not ready`);
-  } catch (err) {
-    console.warn(`${tag(email)} captureVisibleTab failed: ${err}`);
-  }
-
-  // Fallback: page.screenshot with centre crop
-  console.log(`${tag(email)} Falling back to page.screenshot()`);
+// ─── Take 3 row-strip screenshots ────────────────────────────────────────────
+// Crops 45px top+bottom to remove the question overlay, then splits the remaining
+// dialog height into 3 equal strips — one per captcha grid row.
+// Separate row images reduce per-image complexity for the vision model.
+async function takeRowScreenshots(page: Page, _email: string): Promise<Buffer[]> {
   const vp = page.viewportSize() ?? { width: 1920, height: 1080 };
-  const clip = {
-    x:      Math.round(vp.width  * 0.30),
-    y:      Math.round(vp.height * 0.20),
-    width:  Math.round(vp.width  * 0.40),
-    height: Math.round(vp.height * 0.60),
-  };
-  const buf = Buffer.from(await page.screenshot({ type: "jpeg", quality: 90, clip }));
-  console.log(`${tag(email)} page.screenshot: ${Math.round(buf.length / 1024)}KB`);
-  return buf;
+  const baseX      = Math.round(vp.width  * 0.36) + 40;   // +40px horizontal inset from each side
+  const baseY      = Math.round(vp.height * 0.26) + 45;   // crop 45px from top
+  const baseWidth  = Math.round(vp.width  * 0.28) - 80;   // -40px left + -40px right
+  const baseHeight = Math.round(vp.height * 0.48) - 90;   // crop 45px top + 45px bottom
+  const rowH       = Math.floor(baseHeight / 3);
+
+  const buffers: Buffer[] = [];
+  for (let i = 0; i < 3; i++) {
+    const clip = { x: baseX, y: baseY + i * rowH, width: baseWidth, height: rowH };
+    buffers.push(Buffer.from(await page.screenshot({ type: "jpeg", quality: 92, clip })));
+  }
+  return buffers;
 }
 
 // ─── Shadow DOM captcha visibility ───────────────────────────────────────────
@@ -289,14 +325,6 @@ async function detectGrid(page: Page): Promise<{ rows: number; cols: number }> {
 
 // ─── Click a grid tile ────────────────────────────────────────────────────────
 async function clickGridTile(page: Page, row: number, col: number, rows: number, cols: number): Promise<boolean> {
-  // Compute tile centre coordinates using two strategies, in priority order.
-  // Strategy A: find the grid CONTAINER (uniform-sized children heuristic, mirrors
-  //   the old extension's findGridTiles), get visible children by index, return their
-  //   bounding rect centre. Avoids the class-name guessing that was matching wrong images.
-  // Strategy B: collect every <img> inside the modal across all shadow DOM levels.
-  //   If ≥ (rows×cols) found, derive the grid rect from their bounding rects.
-  // Strategy C: fall back to the proportions proven by the old extension:
-  //   left=5%, top=22%, width=90%, height=63% of the modal rect.
   const coords = await page.evaluate(
     ({ row, col, rows, cols }) => {
       const TEXT = "Let's confirm you are human";
@@ -311,7 +339,6 @@ async function clickGridTile(page: Page, row: number, col: number, rows: number,
         return Array.from(el.children).filter(isVisible);
       }
 
-      // Smallest element containing captcha heading with size ≥ 150×200
       function findModal(): Element | null {
         let best: Element | null = null;
         let bestArea = Infinity;
@@ -330,8 +357,6 @@ async function clickGridTile(page: Page, row: number, col: number, rows: number,
         return best;
       }
 
-      // Strategy A: uniform-grid heuristic — find a container div/ul/ol whose
-      // direct visible children are roughly the same size and contain image content.
       function findGridContainer(root: Document | ShadowRoot | Element): Element | null {
         for (const el of Array.from(root.querySelectorAll("div,ul,ol"))) {
           const s = (el as Element & { shadowRoot?: ShadowRoot }).shadowRoot;
@@ -350,7 +375,6 @@ async function clickGridTile(page: Page, row: number, col: number, rows: number,
           if (avgW < 20 || avgH < 20) continue;
           if ((Math.max(...ws) - Math.min(...ws)) > avgW * 0.35 &&
               (Math.max(...hs) - Math.min(...hs)) > avgH * 0.35) continue;
-          // At least 40% of children must have an img or background image
           const withContent = ch.filter(c =>
             c.querySelector("img") ||
             window.getComputedStyle(c).backgroundImage !== "none"
@@ -361,7 +385,6 @@ async function clickGridTile(page: Page, row: number, col: number, rows: number,
         return null;
       }
 
-      // Strategy B: collect all <img> elements recursively through all shadow roots
       function collectImgs(root: Document | ShadowRoot | Element): HTMLImageElement[] {
         const imgs: HTMLImageElement[] = [];
         for (const el of Array.from(root.querySelectorAll("*"))) {
@@ -378,7 +401,7 @@ async function clickGridTile(page: Page, row: number, col: number, rows: number,
       if (!modal) return null;
       const mRect = modal.getBoundingClientRect();
 
-      // Strategy A ─────────────────────────────────────────────────────────────
+      // Strategy A: uniform-grid container heuristic
       const grid = findGridContainer(modal);
       if (grid) {
         const ch  = visibleChildren(grid);
@@ -389,7 +412,7 @@ async function clickGridTile(page: Page, row: number, col: number, rows: number,
         }
       }
 
-      // Strategy B ─────────────────────────────────────────────────────────────
+      // Strategy B: collect all <img> elements in modal
       const allImgs = collectImgs(modal).filter(img => {
         const r = img.getBoundingClientRect();
         return r.left >= mRect.left - 10 && r.right  <= mRect.right  + 10 &&
@@ -406,7 +429,7 @@ async function clickGridTile(page: Page, row: number, col: number, rows: number,
         return { x: gLeft + (col - 0.5) * tW, y: gTop + (row - 0.5) * tH, strategy: "B" };
       }
 
-      // Strategy C — proportions from old extension (proven on live Amazon captchas)
+      // Strategy C: proven proportions
       const gLeft   = mRect.left  + mRect.width  * 0.05;
       const gTop    = mRect.top   + mRect.height * 0.22;
       const gWidth  = mRect.width  * 0.90;
@@ -421,9 +444,51 @@ async function clickGridTile(page: Page, row: number, col: number, rows: number,
   if (coords) {
     console.log(`[Captcha] tile(${row},${col}) strategy=${coords.strategy} → (${Math.round(coords.x)},${Math.round(coords.y)})`);
     await page.mouse.click(coords.x, coords.y);
+    // Flush the browser's JS event queue — guarantees click handler ran and DOM updated
+    await page.evaluate(() => new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r()))));
     return true;
   }
   return false;
 }
 
-function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+// ─── Wait for submit outcome ──────────────────────────────────────────────────
+// Polls until captcha disappears (solved) or "Incorrect" text appears (wrong answer).
+// No static sleep — resolves as soon as the browser signals a result.
+async function waitForSubmitResult(
+  page: Page,
+  email: string,
+  timeout = 8_000
+): Promise<"solved" | "incorrect" | "timeout"> {
+  console.log(`${tag(email)} Waiting for submit result...`);
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const state = await page.evaluate(() => {
+      const HEADING   = "Let's confirm you are human";
+      const INCORRECT = "Incorrect";
+      function scan(root: Document | ShadowRoot): { heading: boolean; incorrect: boolean } {
+        const txt = (root as Document).textContent ?? "";
+        let heading = txt.includes(HEADING), incorrect = txt.includes(INCORRECT);
+        for (const el of Array.from(root.querySelectorAll("*"))) {
+          const s = (el as Element & { shadowRoot?: ShadowRoot }).shadowRoot;
+          if (s) { const r = scan(s); heading ||= r.heading; incorrect ||= r.incorrect; }
+        }
+        return { heading, incorrect };
+      }
+      return scan(document);
+    }).catch(() => ({ heading: true, incorrect: false }));
+
+    if (!state.heading) return "solved";
+    if (state.incorrect) return "incorrect";
+    await new Promise(r => setTimeout(r, 80));
+  }
+  console.warn(`${tag(email)} waitForSubmitResult timed out`);
+  return "timeout";
+}
+
+// ─── Wait for new challenge to be ready ───────────────────────────────────────
+async function waitForNewChallenge(_page: Page, email: string): Promise<void> {
+  console.log(`${tag(email)} Waiting 10s for new challenge to load...`);
+  await new Promise(r => setTimeout(r, 10_000));
+  console.log(`${tag(email)} New challenge ready`);
+}
+

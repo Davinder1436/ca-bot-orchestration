@@ -1,4 +1,5 @@
 import Redis from "ioredis";
+import http from "http";
 import { EventBus } from "./events/event-bus";
 import { launchBrowser, createContext, pickUAIndex, USER_AGENTS, VIEWPORTS } from "./browser/launch";
 import { login } from "./amazon/login";
@@ -8,6 +9,26 @@ import { applyForJob } from "./amazon/apply";
 import { solveCaptchaOnPage } from "./amazon/captcha";
 import type { Browser, BrowserContext, Page } from "playwright";
 import axios from "axios";
+
+// Test the ISP proxy by issuing an HTTP CONNECT request (exactly what Chrome does
+// for HTTPS sites). Returns true only if the proxy accepts the tunnel.
+async function testProxyConnect(host: string, port: number, user: string, pass: string, timeoutMs = 10_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const auth = Buffer.from(`${user}:${pass}`).toString("base64");
+    const req = http.request({
+      host,
+      port,
+      method: "CONNECT",
+      path: "hiring.amazon.ca:443",
+      headers: { "Proxy-Authorization": `Basic ${auth}`, "Host": "hiring.amazon.ca:443" },
+      timeout: timeoutMs,
+    });
+    req.on("connect", (_res, socket) => { socket.destroy(); resolve(true); });
+    req.on("timeout",  () => { req.destroy(); resolve(false); });
+    req.on("error",    () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
 
 const REDIS_URL = process.env.REDIS_URL!;
 const ACCOUNT_ID = process.env.ACCOUNT_ID!;
@@ -21,6 +42,15 @@ const ISP_USER = process.env.BRIGHTDATA_ISP_USER;
 const ISP_PASS = process.env.BRIGHTDATA_ISP_PASS;
 const ispProxyUrl = (ISP_HOST && ISP_PORT && ISP_USER && ISP_PASS)
   ? `http://${ISP_USER}-session-${ACCOUNT_ID.slice(0, 8)}:${ISP_PASS}@${ISP_HOST}:${ISP_PORT}`
+  : undefined;
+
+// Bright Data DC rotating proxy — no session ID = new IP per request (40k pool)
+const DC_HOST = process.env.BRIGHTDATA_DC_HOST;
+const DC_PORT = process.env.BRIGHTDATA_DC_PORT;
+const DC_USER = process.env.BRIGHTDATA_DC_USER;
+const DC_PASS = process.env.BRIGHTDATA_DC_PASS;
+const rotatingDcProxyUrl = (DC_HOST && DC_PORT && DC_USER && DC_PASS)
+  ? `http://${DC_USER}:${DC_PASS}@${DC_HOST}:${DC_PORT}`
   : undefined;
 
 if (!REDIS_URL || !ACCOUNT_ID) {
@@ -103,10 +133,21 @@ async function main() {
   const account = await fetchAccountConfig();
   console.log(`[Worker:${ACCOUNT_ID}] Account: ${account.email}, Jobs: ${account.jobIds.join(", ")}`);
 
-  // ISP proxy takes priority; falls back to per-account proxy from DB
-  const proxyUrl = ispProxyUrl ?? PROXY_URL ?? account.proxy?.url;
-  if (ispProxyUrl) {
-    console.log(`[Worker:${ACCOUNT_ID}] Using Bright Data ISP fixed-session proxy (session: ${ACCOUNT_ID.slice(0, 8)})`);
+  // ISP proxy: verify the CONNECT tunnel before committing.
+  // Chrome sends HTTP CONNECT to establish HTTPS tunnels through a proxy.
+  // If the proxy hangs on CONNECT (common when auth isn't accepted pre-emptively),
+  // every page.goto() will timeout — so we gate usage on a live CONNECT test.
+  let proxyUrl = PROXY_URL ?? account.proxy?.url;
+  if (ispProxyUrl && ISP_HOST && ISP_PORT && ISP_USER && ISP_PASS) {
+    const fullUser = `${ISP_USER}-session-${ACCOUNT_ID.slice(0, 8)}`;
+    console.log(`[Worker:${ACCOUNT_ID}] Testing ISP proxy ${ISP_HOST}:${ISP_PORT} (session: ${ACCOUNT_ID.slice(0, 8)})...`);
+    const ok = await testProxyConnect(ISP_HOST, parseInt(ISP_PORT), fullUser, ISP_PASS);
+    if (ok) {
+      proxyUrl = ispProxyUrl;
+      console.log(`[Worker:${ACCOUNT_ID}] ISP proxy OK — CONNECT tunnel accepted`);
+    } else {
+      console.warn(`[Worker:${ACCOUNT_ID}] ISP proxy CONNECT test failed (unreachable or auth rejected from this container) — falling back to direct/account proxy`);
+    }
   }
 
   const uaIndex = pickUAIndex(ACCOUNT_ID);
@@ -116,6 +157,10 @@ async function main() {
     jobIds: account.jobIds,
     proxyUrl: proxyUrl ?? null,
   });
+  await runLogger.log(
+    `Worker started — email=${account.email} jobs=${account.jobIds.length} proxy=${proxyUrl ? "ISP" : "none"}`,
+    "info"
+  ).catch(() => {});
 
   // Launch browser
   browser = await launchBrowser({ proxyUrl });
@@ -158,9 +203,11 @@ async function main() {
       country: account.country,
       accountId: ACCOUNT_ID,
     });
+    await runLogger.log(`Login successful — session established`, "info").catch(() => {});
   } catch (err) {
     const reason = String(err);
     console.error(`[Worker:${ACCOUNT_ID}] Login failed:`, err);
+    await runLogger.log(`Login failed: ${reason}`, "error").catch(() => {});
     await setState(bus, "ERROR");
     await bus.publish("worker:crashed", {
       accountId: ACCOUNT_ID,
@@ -194,7 +241,11 @@ async function main() {
       // Rate-limit test command — runs inside the worker's authenticated browser
       if (cmd.testId && cmd.jobId) {
         const rpms: number[] = cmd.rpms ?? [5, 10, 20, 30, 40, 50, 60, 80, 100];
-        poller?.runRateLimitTest(cmd.testId, cmd.jobId, rpms).catch(console.error);
+        if (cmd.proxyType === "rotating_dc") {
+          poller?.runRotatingProxyTest(cmd.testId, cmd.jobId, rpms).catch(console.error);
+        } else {
+          poller?.runRateLimitTest(cmd.testId, cmd.jobId, rpms).catch(console.error);
+        }
       }
     } catch { /* ignore malformed */ }
   });
@@ -209,10 +260,12 @@ async function main() {
       if (!running) return;
 
       const { applyUrl, email } = event.payload;
+      await runLogger.log(`Apply triggered: ${applyUrl.slice(0, 80)}`, "info").catch(() => {});
       await setState(bus, "APPLYING");
       const success = await applyForJob(context!, applyUrl, email);
 
       if (success) {
+        await runLogger.log(`Apply successful: scheduleId=${event.payload.scheduleId}`, "info").catch(() => {});
         await bus.publish("job:application_confirmed", {
           accountId: ACCOUNT_ID,
           email: account.email,
@@ -239,6 +292,7 @@ async function main() {
       intervalMs: 5_000,
       runLogger,
       redis,
+      rotatingDcProxyUrl,
     },
     bus
   );
@@ -250,6 +304,7 @@ async function main() {
     const event = JSON.parse(raw);
     if (event.payload?.accountId !== ACCOUNT_ID) return;
     console.log(`[Worker:${ACCOUNT_ID}] Session expired — re-logging in`);
+    await runLogger.log(`Session expired — re-logging in`, "warn").catch(() => {});
     poller?.stop();
     await setState(bus, "LOGGING_IN");
     try {
@@ -259,6 +314,7 @@ async function main() {
         country: account.country,
         accountId: ACCOUNT_ID,
       });
+      await runLogger.log(`Re-login successful`, "info").catch(() => {});
       await redis.set(`worker:token:${ACCOUNT_ID}`, newToken, "EX", 3600);
       const newPollingPage = context!.pages().find(p => p.url().includes("jobSearch"))
         ?? context!.pages()[context!.pages().length - 1];
@@ -268,6 +324,7 @@ async function main() {
       poller!.start(); // restart
     } catch (err) {
       console.error(`[Worker:${ACCOUNT_ID}] Re-login failed:`, err);
+      await runLogger.log(`Re-login failed: ${String(err)}`, "error").catch(() => {});
       await setState(bus, "ERROR");
     }
   });

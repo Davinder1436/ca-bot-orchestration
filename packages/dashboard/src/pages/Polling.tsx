@@ -117,17 +117,15 @@ function JobRow({ jobId, ticks }: { jobId: string; ticks: PollTick[] }) {
   );
 }
 
-// Rate slider: min 500ms, max 30000ms, step 500ms
-const SLIDER_MIN = 500;
+// Rate slider: min 300ms (200 RPM), max 30000ms, step 100ms
+const SLIDER_MIN = 300;
 const SLIDER_MAX = 30_000;
-const SLIDER_STEP = 500;
+const SLIDER_STEP = 100;
 
-function rpmFromInterval(intervalMs: number, jobCount: number) {
-  if (intervalMs <= 0 || jobCount <= 0) return 0;
-  // RPM = jobCount × 60000 / (interval + avg stagger per job)
-  // Stagger adds ~2250ms per job gap: (jobCount-1) × 2250
-  const avgCycleMs = intervalMs + Math.max(0, jobCount - 1) * 2_250;
-  return Math.round((jobCount * 60_000) / avgCycleMs);
+function rpmFromInterval(intervalMs: number, _jobCount: number) {
+  if (intervalMs <= 0) return 0;
+  // With adaptive stagger = intervalMs, total RPM = 60000/interval regardless of job count
+  return Math.round(60_000 / intervalMs);
 }
 
 function AccountCard({
@@ -161,7 +159,7 @@ function AccountCard({
   const [applyStatus, setApplyStatus] = useState<"idle" | "ok" | "err">("idle");
 
   const previewRpm = rpmFromInterval(sliderVal, allJobIds.length);
-  const minSafeMs  = allJobIds.length > 0 ? Math.ceil((allJobIds.length * 60_000) / 100) : 500;
+  const minSafeMs  = 300; // 200 RPM max (below throttle threshold)
 
   const applyRate = useCallback(async () => {
     setApplying(true);
@@ -253,7 +251,7 @@ function AccountCard({
                 className="w-full h-1.5 rounded-full appearance-none bg-gray-700 accent-brand-500 cursor-pointer"
               />
               <div className="flex justify-between text-[10px] text-gray-700 mt-1">
-                <span>0.5s (fast)</span>
+                <span>0.3s (~200 RPM)</span>
                 <span>30s (slow)</span>
               </div>
             </div>
@@ -270,7 +268,7 @@ function AccountCard({
             </div>
           </div>
           <p className="text-[10px] text-gray-700 mt-2">
-            Max safe interval enforced to stay under 100 RPM across {allJobIds.length} job{allJobIds.length !== 1 ? "s" : ""} ({(minSafeMs / 1000).toFixed(1)}s min).
+            Max rate: 200 RPM (0.3s interval). Throttling observed above 200 RPM.
           </p>
         </div>
       )}
@@ -309,12 +307,15 @@ function FeedRow({ tick }: { tick: PollTick }) {
 
 // ─── Main page ────────────────────────────────────────────────────────────────
 
+interface WorkerStats { total: number; active: number; empty: number; throttled: number; error: number }
+
 export function Polling() {
   const [seeds, setSeeds]               = useState<Record<string, WorkerSeed>>({});
   const [pollingState, setPollingState] = useState<PollingState>({});
   const [feed, setFeed]                 = useState<PollTick[]>([]);
   const [connected, setConnected]       = useState(false);
   const [totalTicks, setTotalTicks]     = useState(0);
+  const [totalThrottled, setTotalThrottled] = useState(0);
   const [loading, setLoading]           = useState(true);
   const [refreshAt, setRefreshAt]       = useState(Date.now());
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -333,7 +334,7 @@ export function Polling() {
 
         if (cancelled) return;
 
-        const running = new Set(workersRes.data.running);
+        const running = workersRes.data.running;
         const accountMap: Record<string, Account> = {};
         for (const acc of accountsRes.data) accountMap[acc.id] = acc;
 
@@ -349,6 +350,20 @@ export function Polling() {
           };
         }
         setSeeds(newSeeds);
+
+        // Seed persistent counters from Redis stats (survive tab navigation)
+        const statsResults = await Promise.allSettled(
+          running.map(id => api.get<{ runId: string | null; stats: WorkerStats | null }>(`/workers/${id}/stats`))
+        );
+        let sumTotal = 0, sumThrottled = 0;
+        for (const r of statsResults) {
+          if (r.status === "fulfilled" && r.value.data.stats) {
+            sumTotal     += r.value.data.stats.total;
+            sumThrottled += r.value.data.stats.throttled;
+          }
+        }
+        if (sumTotal > 0)     setTotalTicks(sumTotal);
+        if (sumThrottled > 0) setTotalThrottled(sumThrottled);
       } catch {
         // ignore — socket events still work
       } finally {
@@ -389,6 +404,7 @@ export function Polling() {
       const tick = event.payload as unknown as PollTick;
 
       setTotalTicks(n => n + 1);
+      if (tick.result === "throttled") setTotalThrottled(n => n + 1);
 
       setPollingState(prev => {
         const acct    = prev[tick.accountId] ?? {};
@@ -428,9 +444,8 @@ export function Polling() {
     return n + Math.max(fromSeed, fromEvents);
   }, 0);
 
-  const recentFeed     = feed.filter(t => Date.now() - t.timestamp < 60_000);
-  const avgRpm         = recentFeed.length;
-  const totalThrottled = feed.filter(t => t.result === "throttled").length;
+  const recentFeed = feed.filter(t => Date.now() - t.timestamp < 60_000);
+  const avgRpm     = recentFeed.length;
 
   return (
     <div className="p-6 space-y-6 min-h-full">

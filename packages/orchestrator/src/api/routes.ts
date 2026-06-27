@@ -209,6 +209,24 @@ export function createRouter(
     });
   });
 
+  // ── Worker run stats (persisted poll counters) ───────────────
+  router.get("/workers/:accountId/stats", wrap(async (req, res) => {
+    const { accountId } = req.params;
+    const runId = await redis.get(`worker:current-run:${accountId}`);
+    if (!runId) { res.json({ runId: null, stats: null }); return; }
+    const raw = await redis.hgetall(`run:stats:${runId}`);
+    res.json({
+      runId,
+      stats: {
+        total:     parseInt(raw?.total     ?? "0"),
+        active:    parseInt(raw?.active    ?? "0"),
+        empty:     parseInt(raw?.empty     ?? "0"),
+        throttled: parseInt(raw?.throttled ?? "0"),
+        error:     parseInt(raw?.error     ?? "0"),
+      },
+    });
+  }));
+
   // ── Polling rate control ──────────────────────────────────────
   // PATCH /workers/:accountId/polling-rate   body: { intervalMs: number }
   router.patch("/workers/:accountId/polling-rate", wrap(async (req, res) => {
@@ -234,10 +252,11 @@ export function createRouter(
   // always 403s. Tests are dispatched to the worker via Redis and results stream
   // back via the event bus → socket.io.
   router.post("/tests/rate-limit/start", wrap(async (req, res) => {
-    const { accountId, jobId, rpms } = req.body as {
+    const { accountId, jobId, rpms, proxyType } = req.body as {
       accountId?: string;
       jobId?: string;
       rpms?: number[];
+      proxyType?: "session" | "rotating_dc";
     };
 
     if (!accountId) { res.status(400).json({ error: "accountId required" }); return; }
@@ -267,6 +286,7 @@ export function createRouter(
       testId,
       jobId,
       rpms: rpms ?? [5, 10, 20, 30, 40, 50, 60, 80, 100],
+      proxyType: proxyType ?? "session",
     }));
 
     res.json({ testId });

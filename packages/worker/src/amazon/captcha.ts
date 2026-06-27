@@ -1,10 +1,11 @@
 import type { Page } from "playwright";
 import axios from "axios";
+import sharp from "sharp";
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY ?? "";
 const GROQ_MODEL   = "meta-llama/llama-4-scout-17b-16e-instruct";
 const MAX_ATTEMPTS = 10;
-const CONFIDENCE_THRESHOLD = 0.5;
+const CONFIDENCE_THRESHOLD = 0.8;
 
 const tag = (email: string) => `[Captcha:${email}]`;
 
@@ -35,10 +36,12 @@ export async function solveCaptchaOnPage(page: Page, accountEmail: string): Prom
     await waitForCaptchaReady(page, accountEmail);
 
     const screenshotStart = Date.now();
-    const rowBuffers = await takeRowScreenshots(page, accountEmail);
-    const imageBase64s = rowBuffers.map(b => `data:image/jpeg;base64,${b.toString("base64")}`);
+    const imgs = await takeCaptchaImages(page);
+    const rawB64   = `data:image/jpeg;base64,${imgs.raw.toString("base64")}`;
+    const edgesB64 = `data:image/jpeg;base64,${imgs.edges.toString("base64")}`;
+    const colorB64 = `data:image/jpeg;base64,${imgs.color.toString("base64")}`;
     screenshotMs = Date.now() - screenshotStart;
-    console.log(`${tag(accountEmail)} Screenshots: ${rowBuffers.map(b => `${Math.round(b.length / 1024)}KB`).join("+")} (${screenshotMs}ms)`);
+    console.log(`${tag(accountEmail)} Images: raw=${Math.round(imgs.raw.length/1024)}KB edges=${Math.round(imgs.edges.length/1024)}KB color=${Math.round(imgs.color.length/1024)}KB (${screenshotMs}ms)`);
 
     // Extract question from DOM / shadow DOM
     const rawQuestion = await extractQuestion(page);
@@ -48,7 +51,7 @@ export async function solveCaptchaOnPage(page: Page, accountEmail: string): Prom
     console.log(`${tag(accountEmail)} Using question: "${question}"`);
 
     // Emit tile images to dashboard — rendered as visual tile grid, NOT raw base64 in text logs
-    console.log(`[Captcha:tiles] ${JSON.stringify({ attempt, question, r1: imageBase64s[0], r2: imageBase64s[1], r3: imageBase64s[2] })}`);
+    console.log(`[Captcha:tiles] ${JSON.stringify({ attempt, question, raw: rawB64, edges: edgesB64, color: colorB64 })}`);
 
     // Detect grid size
     const { rows, cols } = await detectGrid(page);
@@ -58,21 +61,27 @@ export async function solveCaptchaOnPage(page: Page, accountEmail: string): Prom
     let tiles: Array<{ row: number; column: number }> = [];
     const aiCallStart = Date.now();
     try {
-      console.log(`${tag(accountEmail)} → Groq Scout (confidence mode)`);
+      console.log(`${tag(accountEmail)} → Groq Scout (3-image confidence mode)`);
       const resp = await axios.post(
         "https://api.groq.com/openai/v1/chat/completions",
         {
           model: GROQ_MODEL,
           max_tokens: 512,
-          messages: [{
-            role: "user",
-            content: [
-              { type: "text",      text: buildCaptchaPrompt(question, rows, cols) },
-              { type: "image_url", image_url: { url: imageBase64s[0] } },
-              { type: "image_url", image_url: { url: imageBase64s[1] } },
-              { type: "image_url", image_url: { url: imageBase64s[2] } },
-            ],
-          }],
+          messages: [
+            {
+              role: "system",
+              content: buildSystemPrompt(rows, cols),
+            },
+            {
+              role: "user",
+              content: [
+                { type: "text",      text: buildUserPrompt(question, rows, cols) },
+                { type: "image_url", image_url: { url: rawB64 } },
+                { type: "image_url", image_url: { url: edgesB64 } },
+                { type: "image_url", image_url: { url: colorB64 } },
+              ],
+            },
+          ],
         },
         {
           headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
@@ -151,32 +160,33 @@ export async function solveCaptchaOnPage(page: Page, accountEmail: string): Prom
   throw new Error(`[Captcha] FAILED after ${MAX_ATTEMPTS} attempts — stopping worker`);
 }
 
-// ─── Prompt ───────────────────────────────────────────────────────────────────
+// ─── Prompts ──────────────────────────────────────────────────────────────────
 
-function buildCaptchaPrompt(question: string, rows: number, cols: number): string {
-  const rowLabels = Array.from({ length: rows }, (_, i) =>
-    `  Image ${i + 1} = Row ${i + 1} (${i === 0 ? "top" : i === rows - 1 ? "bottom" : "middle"})`
-  ).join("\n");
-  return `You are solving an Amazon image verification challenge.
+function buildSystemPrompt(rows: number, cols: number): string {
+  return `You are an expert Amazon CAPTCHA solver. You will receive 3 images — all showing the SAME ${rows}×${cols} grid captcha from different visual perspectives.
 
-The captcha shows a ${rows}×${cols} grid. I am sending ${rows} separate images — one per row:
-${rowLabels}
+HOW TO READ EACH IMAGE:
+• Image 1 — Raw photo: The actual captcha as it appears in the browser. Use this as your primary reference for identifying object types. Row 1 = top row, row ${rows} = bottom row. Column 1 = left tile, column ${cols} = right tile.
+• Image 2 — Sobel edge detection (grayscale): Object boundaries and contour shapes are amplified as bright lines. Use this to distinguish object silhouettes (e.g. a bucket's rounded body + handle arc vs. a flat bed frame) when objects are visually similar in Image 1.
+• Image 3 — LAB color amplification (6×): Color differences are amplified 6× in perceptual color space. Objects that look nearly identical in color in Image 1 become vivid and clearly distinct here. Use this to catch low-contrast tiles — a bed that blends into a brick background in Image 1 will appear as a clearly different hue in Image 3.
 
-Each image shows ${cols} tiles side by side: column 1 = left, column ${cols} = right.
+STRATEGY:
+1. Read the task in the user message to know the target object category.
+2. Scan Image 1 to identify which tiles clearly show the target.
+3. Cross-reference Image 2 (edges) to verify object shapes and boundaries.
+4. Use Image 3 (color) to catch any ambiguous tiles where subtle color differences reveal the target hiding against a similar background.
+5. Rate EVERY tile with a confidence float: 1.0 = definitely the target, 0.0 = definitely not.`;
+}
 
-Task: "${question}"
+function buildUserPrompt(question: string, rows: number, cols: number): string {
+  return `Task: "${question}"
 
-For EVERY tile in all ${rows} images, rate your confidence that the target object is present in that tile.
-Use a float from 0.0 (definitely absent) to 1.0 (definitely present).
+The 3 images above all show the same ${rows}×${cols} captcha grid (rows 1–${rows} top-to-bottom, columns 1–${cols} left-to-right).
 
-Reply with ONLY a JSON array of exactly ${rows * cols} objects — no explanation, no markdown:
-[
-  {"row":1,"column":1,"confidence":0.95},
-  {"row":1,"column":2,"confidence":0.05},
-  {"row":1,"column":3,"confidence":0.8},
-  {"row":2,"column":1,"confidence":0.0},
-  ...
-]`;
+For EVERY tile (${rows * cols} total), output your confidence (0.0–1.0) that the target object appears in that tile.
+
+Reply with ONLY a JSON array of exactly ${rows * cols} objects — no markdown, no explanation:
+[{"row":1,"column":1,"confidence":0.95},{"row":1,"column":2,"confidence":0.05},...]`;
 }
 
 // ─── Parse confidence response ────────────────────────────────────────────────
@@ -236,24 +246,89 @@ async function waitForCaptchaReady(page: Page, email: string): Promise<void> {
   console.log(`${tag(email)} Captcha heading detected`);
 }
 
-// ─── Take 3 row-strip screenshots ────────────────────────────────────────────
-// Crops 45px top+bottom to remove the question overlay, then splits the remaining
-// dialog height into 3 equal strips — one per captcha grid row.
-// Separate row images reduce per-image complexity for the vision model.
-async function takeRowScreenshots(page: Page, _email: string): Promise<Buffer[]> {
+// ─── Capture full grid + two processed variants ───────────────────────────────
+// Same crop region as before (baseWidth × baseHeight = combined 3-strip dimensions).
+// Returns raw JPEG, Sobel edge-detected grayscale JPEG, and LAB-color-amplified JPEG.
+async function takeCaptchaImages(page: Page): Promise<{ raw: Buffer; edges: Buffer; color: Buffer }> {
   const vp = page.viewportSize() ?? { width: 1920, height: 1080 };
-  const baseX      = Math.round(vp.width  * 0.36) + 40;   // +40px horizontal inset from each side
-  const baseY      = Math.round(vp.height * 0.26) + 45;   // crop 45px from top
-  const baseWidth  = Math.round(vp.width  * 0.28) - 80;   // -40px left + -40px right
-  const baseHeight = Math.round(vp.height * 0.48) - 90;   // crop 45px top + 45px bottom
-  const rowH       = Math.floor(baseHeight / 3);
+  const x      = Math.round(vp.width  * 0.36) + 40;
+  const y      = Math.round(vp.height * 0.26) + 45;
+  const width  = Math.round(vp.width  * 0.28) - 80;
+  const height = Math.round(vp.height * 0.48) - 90;
 
-  const buffers: Buffer[] = [];
-  for (let i = 0; i < 3; i++) {
-    const clip = { x: baseX, y: baseY + i * rowH, width: baseWidth, height: rowH };
-    buffers.push(Buffer.from(await page.screenshot({ type: "jpeg", quality: 92, clip })));
+  const raw = Buffer.from(await page.screenshot({ type: "jpeg", quality: 92, clip: { x, y, width, height } }));
+  const [edges, color] = await Promise.all([applyGrayscaleSobel(raw), applyLabAmplified(raw)]);
+  return { raw, edges, color };
+}
+
+// Sobel edge detection — highlights object boundaries as bright lines on black.
+async function applyGrayscaleSobel(jpegBuf: Buffer): Promise<Buffer> {
+  const { data, info } = await sharp(jpegBuf).raw().toBuffer({ resolveWithObject: true });
+  const { width, height, channels } = info;
+
+  const gray = new Float32Array(width * height);
+  for (let i = 0; i < width * height; i++) {
+    gray[i] = 0.299 * data[i * channels] + 0.587 * data[i * channels + 1] + 0.114 * data[i * channels + 2];
   }
-  return buffers;
+
+  const out = Buffer.alloc(width * height * 3);
+  for (let row = 1; row < height - 1; row++) {
+    for (let col = 1; col < width - 1; col++) {
+      const p = (dr: number, dc: number) => gray[(row + dr) * width + (col + dc)];
+      const gx = -p(-1,-1) + p(-1,1) - 2*p(0,-1) + 2*p(0,1) - p(1,-1) + p(1,1);
+      const gy = -p(-1,-1) - 2*p(-1,0) - p(-1,1) + p(1,-1) + 2*p(1,0) + p(1,1);
+      const mag = Math.min(255, Math.sqrt(gx * gx + gy * gy));
+      const idx = (row * width + col) * 3;
+      out[idx] = out[idx + 1] = out[idx + 2] = mag;
+    }
+  }
+
+  return sharp(out, { raw: { width, height, channels: 3 } }).jpeg({ quality: 92 }).toBuffer();
+}
+
+// LAB color amplification — A* and B* channels scaled 6× to make subtle color
+// differences (e.g. bed vs. brick background) perceptually vivid.
+async function applyLabAmplified(jpegBuf: Buffer): Promise<Buffer> {
+  const { data, info } = await sharp(jpegBuf).raw().toBuffer({ resolveWithObject: true });
+  const { width, height, channels } = info;
+  const AMP = 6;
+  const out = Buffer.alloc(width * height * 3);
+
+  const lin  = (v: number) => v > 0.04045 ? ((v + 0.055) / 1.055) ** 2.4 : v / 12.92;
+  const fLab = (t: number) => t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116;
+  const fInv = (t: number) => t > 0.2069   ? t ** 3         : (t - 16 / 116) / 7.787;
+  const srgb = (v: number) => Math.max(0, Math.min(1,
+    v > 0.0031308 ? 1.055 * v ** (1 / 2.4) - 0.055 : 12.92 * v
+  ));
+
+  for (let i = 0; i < width * height; i++) {
+    const rl = lin(data[i * channels]     / 255);
+    const gl = lin(data[i * channels + 1] / 255);
+    const bl = lin(data[i * channels + 2] / 255);
+
+    // Linear RGB → XYZ (D65)
+    const X = (rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375) / 0.95047;
+    const Y = (rl * 0.2126729 + gl * 0.7151522 + bl * 0.0721750);
+    const Z = (rl * 0.0193339 + gl * 0.1191920 + bl * 0.9503041) / 1.08883;
+
+    const fx = fLab(X), fy = fLab(Y), fz = fLab(Z);
+    const L  = 116 * fy - 16;
+    const A  = Math.max(-128, Math.min(127, 500 * (fx - fy) * AMP));
+    const B  = Math.max(-128, Math.min(127, 200 * (fy - fz) * AMP));
+
+    // LAB → XYZ → linear RGB
+    const fy2 = (L + 16) / 116;
+    const X2  = fInv(A / 500 + fy2) * 0.95047;
+    const Y2  = fInv(fy2);
+    const Z2  = fInv(fy2 - B / 200) * 1.08883;
+
+    const idx = i * 3;
+    out[idx]     = Math.round(srgb( 3.2404542 * X2 - 1.5371385 * Y2 - 0.4985314 * Z2) * 255);
+    out[idx + 1] = Math.round(srgb(-0.9692660 * X2 + 1.8760108 * Y2 + 0.0415560 * Z2) * 255);
+    out[idx + 2] = Math.round(srgb( 0.0556434 * X2 - 0.2040259 * Y2 + 1.0572252 * Z2) * 255);
+  }
+
+  return sharp(out, { raw: { width, height, channels: 3 } }).jpeg({ quality: 92 }).toBuffer();
 }
 
 // ─── Shadow DOM captcha visibility ───────────────────────────────────────────

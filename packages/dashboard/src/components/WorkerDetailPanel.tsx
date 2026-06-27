@@ -56,7 +56,7 @@ const STATUS_COLOR: Record<string, string> = {
 
 type Tab = "info" | "browser" | "console" | "logs" | "captcha";
 type LogLine = { ts: string; msg: string; color: string };
-type CaptchaTiles = { attempt: number; question: string; r1: string; r2: string; r3: string };
+type CaptchaTiles = { attempt: number; question: string; raw: string; edges: string; color: string };
 type ConsoleMsg = { level: string; text: string; ts: number };
 
 function parseLogLine(raw: string): LogLine | null {
@@ -660,13 +660,15 @@ export function WorkerDetailPanel({ account, liveStatus, onClose, onEdit, onDele
                         )}
                       </div>
                       <div className="flex gap-1 p-2 bg-black/20">
-                        {[att.r1, att.r2, att.r3].map((src, ri) => (
-                          <img
-                            key={ri}
-                            src={src}
-                            alt={`Row ${ri + 1}`}
-                            className="flex-1 min-w-0 rounded border border-gray-800 object-contain"
-                          />
+                        {([["raw", att.raw], ["edges", att.edges], ["color", att.color]] as [string, string][]).map(([label, src]) => (
+                          <div key={label} className="flex-1 min-w-0 flex flex-col gap-0.5">
+                            <span className="text-[9px] text-center text-gray-500 uppercase tracking-wider">{label}</span>
+                            <img
+                              src={src}
+                              alt={label}
+                              className="w-full rounded border border-gray-800 object-contain"
+                            />
+                          </div>
                         ))}
                       </div>
                     </div>
